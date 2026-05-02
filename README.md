@@ -165,7 +165,7 @@ A plain `.txt` file — one word (syllable) per entry, separated by any whitespa
 ```
 And I
 [verse]
-would walk five hun-dred miles
+would walk five hun- dred miles
 ```
 
 ### Selecting a file
@@ -179,14 +179,15 @@ The selected filename is shown above the buttons. The path is remembered for the
 
 All four buttons sit on one row:
 
-| Button | What it does |
-| ------ | ------------ |
-| **Auto-detect** | Find `lyrics.txt` in the project folder |
-| **Browse...** | Pick any `.txt` file |
-| **Clear lyrics** | Remove all lyric events from the whole MIDI take (preserves special game events) |
-| **Assign lyrics** | Clear first, then assign one word per note in start-time order |
+| Button            | What it does                                                                     |
+| ----------------- | -------------------------------------------------------------------------------- |
+| **Auto-detect**   | Find `lyrics.txt` in the project folder                                          |
+| **Browse...**     | Pick any `.txt` file                                                             |
+| **Clear lyrics**  | Remove all lyric events from the whole MIDI take (preserves special game events) |
+| **Assign lyrics** | Clear first, then assign one word per note in start-time order                   |
 
 **Assign lyrics** scope:
+
 - With a time selection — only notes within the selection receive lyrics.
 - Without a time selection — all notes in the RB3 vocal range (C1–C5) on the take are used.
 
@@ -197,7 +198,7 @@ Special game events (`[tambourine_start]`, `[cowbell_start]`, etc.) are always p
 After **Assign lyrics** the result panel shows:
 
 - How many syllables were added and what range was used.
-- A **count mismatch warning** if the number of notes and lyrics words differ — e.g. *"48 notes, 45 lyrics — last 3 notes have no lyric"*.
+- A **count mismatch warning** if the number of notes and lyrics words differ — e.g. _"48 notes, 45 lyrics — last 3 notes have no lyric"_.
 - A **phrase capitalization check**: for each phrase marker note (pitch 105) the script finds the first vocal note that follows it and checks that its assigned lyric starts with an uppercase letter. Violations are listed with their measure number and timestamp so you can jump straight to the problem:
 
   ```
