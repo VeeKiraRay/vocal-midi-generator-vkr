@@ -12,7 +12,7 @@ This document is the canonical reference when working on the script. Read it bef
 
 **Runtime.** REAPER's embedded Lua. UI is ReaImGui (a hard dependency — the script bails on startup if it's missing).
 
-**Single-file constraint.** REAPER scripts are loaded as single files. Don't split into modules. Long file is fine; well-organized sections matter more than line count.
+**Single-file by design choice.** REAPER Lua scripts *can* load other files via `dofile()` or `require()` (use `({reaper.get_action_context()})[2]` to get the current script's own path and derive sibling paths from it). We stay single-file for simpler distribution (one file to download and register) and because the shared state table `S`, the DSP pipeline, and the UI reference each other so heavily that splitting would add friction without meaningful benefit. Long file is fine; well-organized sections matter more than line count.
 
 **Versioning.** Header comment carries `@version`. Bump it whenever behavior or UI changes meaningfully. Mention what's new in the `@about` block.
 
@@ -399,6 +399,13 @@ Not in scope right now but worth keeping in mind so we don't paint ourselves int
 - **Reference MIDI auto-alignment.** Cross-correlating detected onsets with reference onsets to find a global offset, before per-note matching. Would make Reference mode more forgiving.
 - **Local-peak-aware splitting.** Replacing the global-peak split rule with per-syllable local peaks for phrases with very uneven dynamics.
 - **Persist track selections across sessions.** Use `GetTrackGUID` to store the selected tracks in project state. Smart defaults (`SetDefaultTracks`) partially cover this for standard project layouts.
+
+- **Lyrics syllable hint (opt-in, advisory only).** After Assign lyrics, flag tokens that appear to contain multiple syllables without a hyphen — e.g. `"wonderful"` where the user likely meant `"won-"` + `"der-"` + `"ful"`. Reported as an advisory line in the result panel, never blocking. Key design notes:
+  - **Algorithm.** Count vowel-letter groups per token (e.g. `"won"→[o]`, `"der"→[e]`, `"ful"→[u]` = 3 groups → warn). Strip a trailing silent `e` before counting (`"smiles"→"smils"→[i]` = 1 group → no false positive). Tokens that already contain a hyphen are skipped.
+  - **Language behaviour.** Works best for Spanish, Italian, and Portuguese (highly regular vowel-to-syllable mapping, no silent letters). Works reasonably for English with the silent-e rule. Unreliable for French (pervasive silent letters). Irrelevant for Japanese/Korean/Chinese (non-Latin scripts or CV-pattern romaji). Because reliability is language-dependent, this should be **opt-in via a checkbox** (default off) labelled something like *"Syllable hint (best for Spanish/Italian/English)"* so users doing French or Japanese know they can ignore it.
+  - **Threshold.** Only flag tokens with 3+ vowel groups (i.e. likely 3+ syllables) to reduce noise; 2-group words have higher false-positive rates (e.g. many common English monosyllables contain two vowel letters).
+  - **State.** One boolean in `S` (e.g. `S.lyric_syllable_check`), saved with other settings. UI: checkbox in the Lyrics section alongside the file-selection controls.
+  - **Open question before building.** Gather feedback from actual users on whether the false-positive rate at the 3-group threshold is tolerable. The count-mismatch warning already catches the most actionable problem (wrong total syllable count); this feature adds value only if users regularly forget to split individual multi-syllable words.
 
 ---
 
