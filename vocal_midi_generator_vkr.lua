@@ -1606,13 +1606,45 @@ local function Generate()
         S.status = 'Error'; S.last_result = rerr; return
     end
 
-    local _, midi_take = FindMIDIItem(trks.midi, range_info.range_start, range_info.range_end)
+    local midi_item, midi_take = FindMIDIItem(trks.midi, range_info.range_start, range_info.range_end)
+    local clamp_warning = nil
+
+    if not midi_take then
+        -- Full coverage not found; accept any overlapping MIDI item and clamp the range.
+        for i = 0, r.CountTrackMediaItems(trks.midi) - 1 do
+            local it   = r.GetTrackMediaItem(trks.midi, i)
+            local take = r.GetActiveTake(it)
+            if take and r.TakeIsMIDI(take) then
+                local pos  = r.GetMediaItemInfo_Value(it, 'D_POSITION')
+                local iend = pos + r.GetMediaItemInfo_Value(it, 'D_LENGTH')
+                if pos < range_info.range_end and iend > range_info.range_start then
+                    local orig_start = range_info.range_start
+                    local orig_end   = range_info.range_end
+                    range_info.range_start = math.max(range_info.range_start, pos)
+                    range_info.range_end   = math.min(range_info.range_end,   iend)
+                    local trimmed_start = range_info.range_start - orig_start
+                    local trimmed_end   = orig_end - range_info.range_end
+                    local parts = {}
+                    if trimmed_end   > 0.001 then parts[#parts+1] = ('%.2fs trimmed from end'):format(trimmed_end) end
+                    if trimmed_start > 0.001 then parts[#parts+1] = ('%.2fs trimmed from start'):format(trimmed_start) end
+                    clamp_warning = 'Note: audio range clamped to MIDI item bounds (' ..
+                        table.concat(parts, ', ') .. ').\n' ..
+                        ('Audio: %s — %s   MIDI item: %s — %s')
+                            :format(FormatTime(orig_start), FormatTime(orig_end),
+                                    FormatTime(pos),        FormatTime(iend))
+                    midi_item = it
+                    midi_take = take
+                    break
+                end
+            end
+        end
+    end
+
     if not midi_take then
         S.status = 'Error'
         S.last_result =
-            'No MIDI item on the destination track covers the analysis range.\n' ..
-            ('Required coverage: %s — %s\n'):format(FormatTime(range_info.range_start), FormatTime(range_info.range_end)) ..
-            'Create or extend a MIDI item on that track to span the range.'
+            'No MIDI item on the destination track overlaps the analysis range.\n' ..
+            'Create a MIDI item on that track to span the range.'
         return
     end
 
@@ -1636,6 +1668,9 @@ local function Generate()
 
     S.status = 'Done.'
     S.last_result = FormatResult(res, 'Appended', cleared, ps_or_err)
+    if clamp_warning then
+        S.last_result = S.last_result .. '\n\n' .. clamp_warning
+    end
 end
 
 local function RunAutoTune()
