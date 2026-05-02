@@ -31,16 +31,16 @@ A REAPER ReaScript that analyses a vocal audio track and generates MIDI notes al
 
 ## UI overview
 
-<!-- Screenshot placeholder: full script window -->
+![Main window](assets/full-window.jpg)
 
 The window is divided into four main sections:
 
-| Section | Purpose |
-|---|---|
+| Section         | Purpose                                                                      |
+| --------------- | ---------------------------------------------------------------------------- |
 | Track selection | Choose audio source, MIDI destination, and (optionally) reference MIDI track |
-| Note Detection | Sliders that control when and how syllables are detected |
-| Pitch source | Choose how MIDI pitch is assigned to each detected note |
-| MIDI output | Velocity slider, action buttons, result panel |
+| Note Detection  | Sliders that control when and how syllables are detected                     |
+| Pitch source    | Choose how MIDI pitch is assigned to each detected note                      |
+| MIDI output     | Velocity slider, action buttons, result panel                                |
 
 ---
 
@@ -63,44 +63,47 @@ Without a time selection, the full audio item is analysed.
 
 ### Step 3 — Tune the Detection settings
 
-<!-- Screenshot placeholder: Detection section sliders -->
+![Note detection section](assets/note_detection.jpg)
 
 The Detection sliders control the audio energy analysis. Start with defaults and adjust based on what Dry run reports.
 
-| Slider | Range | Default | What to adjust |
-|---|---|---|---|
-| **RMS threshold** | 0.001 – 0.5 | 0.05 | Lower if quiet phrases are missed; raise if noise/breath triggers too many notes. |
-| **Low-pass cutoff** | 0 – 8000 Hz (0 = off) | Off | Set to ~1500–2500 Hz to make sibilants (S, F, SH) invisible to the detector, so note starts snap to the vowel. |
-| **Peak-split ratio** | 0 – 95% (0 = off) | Off | When phrases contain multiple syllables without dropping to silence, this splits them. Start around 40–60% and adjust. |
-| **Min offset to next note** | 0 – 500 ms | 100 ms | Enforces a minimum gap between notes by trimming end times. Prevents notes from running into each other. |
-| **Min note length** | 10 – 500 ms | 60 ms | Discards very short detections (breath noise, consonants). Raise to filter out more. |
-| **RMS window** | 5 – 100 ms | 25 ms | Time resolution of the analysis. Smaller = more precise timing but slower. Rarely needs changing. |
+| Slider                      | Range                 | Default | What to adjust                                                                                                         |
+| --------------------------- | --------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------- |
+| **RMS threshold**           | 0.001 – 0.5           | 0.05    | Lower if quiet phrases are missed; raise if noise/breath triggers too many notes.                                      |
+| **Low-pass cutoff**         | 0 – 8000 Hz (0 = off) | Off     | Set to ~1500–2500 Hz to make sibilants (S, F, SH) invisible to the detector, so note starts snap to the vowel.         |
+| **Peak-split ratio**        | 0 – 95% (0 = off)     | Off     | When phrases contain multiple syllables without dropping to silence, this splits them. Start around 40–60% and adjust. |
+| **Min offset to next note** | 0 – 500 ms            | 100 ms  | Enforces a minimum gap between notes by trimming end times. Prevents notes from running into each other.               |
+| **Min note length**         | 10 – 500 ms           | 60 ms   | Discards very short detections (breath noise, consonants). Raise to filter out more.                                   |
+| **RMS window**              | 5 – 100 ms            | 25 ms   | Time resolution of the analysis. Smaller = more precise timing but slower. Rarely needs changing.                      |
 
 > **Tip:** All sliders support Ctrl+click to type an exact value.
 
 ### Step 4 — Choose a Pitch source
 
-<!-- Screenshot placeholder: Pitch source section -->
+![Pitch source section](assets/pitch-source.jpg)
 
 Select how MIDI pitch is assigned to each detected note:
 
 #### Single pitch
+
 Every note is assigned the same pitch (the **Default pitch** slider). Use this when pitch doesn't matter yet — you just want timing data — or when your game engine uses a single note row for vocals.
 
 #### Reference MIDI
+
 Pitch is taken from an existing MIDI track. For each detected note, the script finds the nearest MIDI note on the reference track (within the **Search tolerance** window) and uses that pitch. Falls back to Default pitch when nothing is within range.
 
 This works well with MIDI output from AI pitch tools like [Basic Pitch](https://basicpitch.spotify.com/). Import the AI MIDI output onto the reference track, then use this mode to transfer those pitches onto your timing-detected notes.
 
 #### Built-in detection (YIN)
+
 The script analyses the audio directly using the [YIN algorithm](http://audition.ens.fr/adc/pdf/2002_JASA_YIN.pdf) to estimate the fundamental frequency of each note. No external MIDI reference needed.
 
-| Slider | Range | Default | Notes |
-|---|---|---|---|
-| **YIN threshold** | 0.01 – 0.5 | 0.15 | Confidence cutoff. Lower = stricter (more fallbacks to Default pitch). Higher = more detections but more octave errors. |
-| **Min frequency** | 40 – 400 Hz | 80 Hz | Set to just below the lowest note in the vocal. |
-| **Max frequency** | 200 – 2000 Hz | 1000 Hz | Set to just above the highest note. |
-| **YIN window** | 10 – 100 ms | 30 ms | Audio length analysed per note. Longer is more stable but may miss very short notes. |
+| Slider            | Range         | Default | Notes                                                                                                                   |
+| ----------------- | ------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
+| **YIN threshold** | 0.01 – 0.5    | 0.15    | Confidence cutoff. Lower = stricter (more fallbacks to Default pitch). Higher = more detections but more octave errors. |
+| **Min frequency** | 40 – 400 Hz   | 80 Hz   | Set to just below the lowest note in the vocal.                                                                         |
+| **Max frequency** | 200 – 2000 Hz | 1000 Hz | Set to just above the highest note.                                                                                     |
+| **YIN window**    | 10 – 100 ms   | 30 ms   | Audio length analysed per note. Longer is more stable but may miss very short notes.                                    |
 
 The algorithm samples audio starting at 30% into each note (to avoid the attack transient and land on the steady-state vowel). Notes where no confident pitch is found fall back to Default pitch.
 
@@ -110,7 +113,7 @@ Two optional checkbox+slider pairs clamp or octave-shift pitches into a target r
 
 ### Step 5 — Dry run and Generate
 
-<!-- Screenshot placeholder: action buttons and result panel -->
+![Action button section](assets/actions.jpg)
 
 - **Dry run** — runs the full detection and pitch assignment pipeline but does not write anything to REAPER. Reports how many notes were found, how many pitches were matched or fell back to default, etc.
 - **Generate notes (append)** — writes notes into the destination MIDI item. Before inserting, it clears any existing notes at the pitches it is about to write (within the analysis range), so re-running is safe and does not stack duplicates.
@@ -121,7 +124,7 @@ The result panel below the buttons shows counts for the last action.
 
 ## Auto-tune from reference
 
-<!-- Screenshot placeholder: Auto-tune button and result panel -->
+![Auto-tune usage](assets/auto_tune_from_reference.jpg)
 
 Auto-tune automates the process of finding Detection slider values that reproduce a set of manually-placed timing reference notes.
 
