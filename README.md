@@ -31,7 +31,7 @@ A REAPER ReaScript that analyses a vocal audio track and generates MIDI notes al
 
 ## UI overview
 
-![Main window](assets/full-window.jpg)
+![Main window](assets/full_window.jpg)
 
 The window is divided into four main sections:
 
@@ -80,7 +80,7 @@ The Detection sliders control the audio energy analysis. Start with defaults and
 
 ### Step 4 — Choose a Pitch source
 
-![Pitch source section](assets/pitch-source.jpg)
+![Pitch source section](assets/pitch_source.jpg)
 
 Select how MIDI pitch is assigned to each detected note:
 
