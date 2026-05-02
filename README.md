@@ -1,6 +1,6 @@
-# Karaoke MIDI Generator
+# Vocal MIDI Generator
 
-A REAPER ReaScript that analyses a vocal audio track and generates MIDI notes aligned to the syllables and phrases it detects. Designed for authoring timing data for rhythm/karaoke games.
+A REAPER ReaScript that analyses a vocal audio track and generates MIDI notes aligned to the syllables and phrases it detects, then assigns lyrics to those notes. Designed for authoring timing and lyric data for rhythm/karaoke games.
 
 ---
 
@@ -33,7 +33,7 @@ A REAPER ReaScript that analyses a vocal audio track and generates MIDI notes al
 
 ![Main window](assets/full_window.jpg)
 
-The window is divided into four main sections:
+The window is divided into five main sections:
 
 | Section         | Purpose                                                                      |
 | --------------- | ---------------------------------------------------------------------------- |
@@ -41,6 +41,7 @@ The window is divided into four main sections:
 | Note Detection  | Sliders that control when and how syllables are detected                     |
 | Pitch source    | Choose how MIDI pitch is assigned to each detected note                      |
 | MIDI output     | Velocity slider, action buttons, result panel                                |
+| Lyrics          | Select a lyrics file and assign words to the generated notes                 |
 
 ---
 
@@ -57,7 +58,7 @@ Optionally, a third **Reference MIDI track** is needed if you use the Reference 
 
 ### Step 2 — (Optional) Make a time selection
 
-If you only want to process part of the song, make a time selection in REAPER before running any action. The script respects the time selection for all operations: detection, auto-tune, and apply pitch changes.
+If you only want to process part of the song, make a time selection in REAPER before running any action. The script respects the time selection for all operations: detection, auto-tune, apply pitch changes, and lyric assignment.
 
 Without a time selection, the full audio item is analysed.
 
@@ -151,6 +152,66 @@ The button is disabled when Pitch source is set to Single pitch (it would just o
 
 ---
 
+## Lyrics
+
+![Lyrics section](assets/lyrics.jpg)
+
+The Lyrics section assigns words from a plain-text file to the MIDI notes on the destination track as lyric text events (the same format REAPER's native lyric tools use).
+
+### Lyrics file format
+
+A plain `.txt` file — one word (syllable) per entry, separated by any whitespace (spaces, tabs, or newlines). Anything inside `[square brackets]` is stripped before splitting, so section headers like `[chorus]` are ignored.
+
+```
+And I
+[verse]
+would walk five hun-dred miles
+```
+
+### Selecting a file
+
+- **Auto-detect** — looks for `lyrics.txt` in the project folder and selects it automatically. Runs on script open and when you switch REAPER project tabs.
+- **Browse...** — opens a file picker starting in the project folder. Only `.txt` files are accepted.
+
+The selected filename is shown above the buttons. The path is remembered for the duration of the session but is not saved to the project file.
+
+### Assigning lyrics
+
+All four buttons sit on one row:
+
+| Button | What it does |
+| ------ | ------------ |
+| **Auto-detect** | Find `lyrics.txt` in the project folder |
+| **Browse...** | Pick any `.txt` file |
+| **Clear lyrics** | Remove all lyric events from the whole MIDI take (preserves special game events) |
+| **Assign lyrics** | Clear first, then assign one word per note in start-time order |
+
+**Assign lyrics** scope:
+- With a time selection — only notes within the selection receive lyrics.
+- Without a time selection — all notes in the RB3 vocal range (C1–C5) on the take are used.
+
+Special game events (`[tambourine_start]`, `[cowbell_start]`, etc.) are always preserved by both Clear and Assign.
+
+### Result panel
+
+After **Assign lyrics** the result panel shows:
+
+- How many syllables were added and what range was used.
+- A **count mismatch warning** if the number of notes and lyrics words differ — e.g. *"48 notes, 45 lyrics — last 3 notes have no lyric"*.
+- A **phrase capitalization check**: for each phrase marker note (pitch 105) the script finds the first vocal note that follows it and checks that its assigned lyric starts with an uppercase letter. Violations are listed with their measure number and timestamp so you can jump straight to the problem:
+
+  ```
+  Phrase capitalization: 2 violation(s):
+    m32  1m 04.250s  "and"
+    m67  2m 14.120s  "it"
+  ```
+
+  If no phrase marker notes are present the check reports that it cannot validate.
+
+> **Tip:** Place phrase markers on your destination MIDI track before running Assign lyrics. The script reads them but never modifies them, so they are safe to have in place throughout the whole authoring process.
+
+---
+
 ## Undo
 
 The **Undo** button directly calls REAPER's undo. It exists because the ImGui window captures keyboard focus, so REAPER's own Ctrl+Z shortcut does not fire while the script window is active. The button is disabled when there is nothing to undo, and the tooltip shows the label of the operation that will be undone.
@@ -176,6 +237,8 @@ Settings are loaded automatically when the script opens (if a save exists for th
 - **Low-pass cutoff makes a big difference** for sibilant-heavy vocals. If note starts consistently land on the consonant instead of the vowel, enable the low-pass filter around 1500–2000 Hz.
 - **Reference MIDI mode + Basic Pitch** is a good combination: Basic Pitch provides reasonable pitch estimates that you can refine with the pitch range constraints, while the script provides tighter timing than Basic Pitch alone.
 - **Auto-tune works best with 10–30 representative reference notes** covering the range of dynamics in the section.
+- **Finish timing and pitch before assigning lyrics.** Assign lyrics runs on notes as they are at the moment you click — if you later split, merge, or reorder notes, re-run Assign lyrics to realign the words. The whole-take clear-and-reassign approach keeps this safe and idempotent.
+- **Name your lyrics file `lyrics.txt` and save it in the project folder.** Auto-detect will find it every time you open the script or switch project tabs, saving you the Browse step entirely.
 
 ---
 

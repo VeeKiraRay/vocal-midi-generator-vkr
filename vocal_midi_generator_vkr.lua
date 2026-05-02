@@ -42,8 +42,20 @@ local MODE_REFERENCE = 1
 local MODE_YIN       = 2
 
 -- Rock Band 3 vocal note range. Notes outside this are phrase/overdrive markers.
-local RB3_MIN_PITCH = 36  -- C1
-local RB3_MAX_PITCH = 84  -- C5
+local RB3_MIN_PITCH    = 36   -- C1
+local RB3_MAX_PITCH    = 84   -- C5
+local RB3_PHRASE_PITCH = 105  -- phrase/overdrive marker pitch
+
+-- Lyric text events that Clear and Assign both preserve (special game events).
+local LYRIC_IGNORE = {
+    ['[tambourine_start]'] = true, ['[tambourine_end]'] = true,
+    ['[cowbell_start]']    = true, ['[cowbell_end]']    = true,
+    ['[clap_start]']       = true, ['[clap_end]']       = true,
+}
+
+-- Suppress the Browse tooltip after a click until the mouse leaves the button;
+-- native file dialogs open on top but the ImGui tooltip persists otherwise.
+local _browse_tooltip_suppressed = false
 
 ----------------------------------------------------------------------
 -- Defaults & state
@@ -76,6 +88,7 @@ local S = {
     audio_idx         = 0,
     midi_idx          = 0,
     ref_idx           = 0,
+    lyrics_path       = '',  -- not persisted; auto-detected on open/project switch
 
     rms_threshold     = DEFAULTS.rms_threshold,
     min_offset_ms     = DEFAULTS.min_offset_ms,
@@ -406,6 +419,32 @@ local TIPS = {
         "Apply pitch changes is only available when Pitch source is set to " ..
         "'Reference MIDI' or 'Built-in detection'. In Single " ..
         "pitch mode, this would overwrite every note with the same pitch.",
+
+    lyrics_auto_detect =
+        "Look for 'lyrics.txt' in the current project folder and select it " ..
+        "automatically. Nothing happens if the file is not found.",
+
+    lyrics_browse =
+        "Open a file browser to select a lyrics file.\n\n" ..
+        "Format: plain text, words separated by any whitespace. " ..
+        "Content inside [square brackets] is stripped before splitting, " ..
+        "so section headers like '[verse]' are ignored.",
+
+    lyrics_clear =
+        "Remove all lyric text events from the entire destination MIDI item.\n\n" ..
+        "Special game events ([tambourine_start], [cowbell_start], etc.) are preserved.",
+
+    lyrics_assign =
+        "Assign lyrics from the file to notes on the destination MIDI item.\n\n" ..
+        "Words are assigned in order to notes in the RB3 vocal pitch range (C1–C5), " ..
+        "sorted by start time.\n\n" ..
+        "Scope:\n" ..
+        " - With time selection: only notes within the selection receive lyrics.\n" ..
+        " - Without time selection: all notes on the MIDI item.\n\n" ..
+        "Existing lyric events are cleared first (special game events preserved).\n\n" ..
+        "After assigning, the result panel shows count-mismatch warnings and a " ..
+        "phrase capitalization check (first word after each phrase marker should " ..
+        "start with an uppercase letter).",
 }
 
 ----------------------------------------------------------------------
@@ -430,6 +469,17 @@ local function SliderTooltip(text)
     if r.ImGui_IsItemHovered(ctx) then
         r.ImGui_SetTooltip(ctx, text .. CTRL_CLICK_HINT)
     end
+end
+
+-- Format a project time position as "mNN  Xm SS.MMMsec" (measure + wall time).
+-- Durations (not positions) should stay in plain seconds — don't use this for them.
+local function FormatTime(t)
+    local mbt = r.format_timestr_pos(t, '', 1)        -- e.g. "90.1.00"
+    local measure = tonumber(mbt:match('^(%d+)'))
+    local mins = math.floor(t / 60)
+    local secs = t - mins * 60
+    local ts = mins > 0 and ('%dm %06.3fs'):format(mins, secs) or ('%.3fs'):format(t)
+    return measure and ('m%d  %s'):format(measure, ts) or ts
 end
 
 local function GetTrackList()
@@ -511,6 +561,22 @@ end
 
 SetDefaultTracks()
 
+local function AutoDetectLyricsFile()
+    local proj_path = r.GetProjectPath('')
+    if not proj_path or proj_path == '' then return false end
+    local sep = (proj_path:sub(-1) == '/' or proj_path:sub(-1) == '\\') and '' or '/'
+    local candidate = proj_path .. sep .. 'lyrics.txt'
+    local f = io.open(candidate, 'r')
+    if f then
+        f:close()
+        S.lyrics_path = candidate
+        return true
+    end
+    return false
+end
+
+AutoDetectLyricsFile()
+
 ----------------------------------------------------------------------
 -- Resolve audio analysis range
 ----------------------------------------------------------------------
@@ -578,6 +644,18 @@ local function FindMIDIItem(track, range_start, range_end)
                 return item, take
             end
         end
+    end
+    return nil, nil
+end
+
+----------------------------------------------------------------------
+-- Find the first MIDI item on a track (no range requirement)
+----------------------------------------------------------------------
+local function FindFirstMIDIItem(midi_track)
+    for i = 0, r.CountTrackMediaItems(midi_track) - 1 do
+        local item = r.GetTrackMediaItem(midi_track, i)
+        local take = r.GetActiveTake(item)
+        if take and r.TakeIsMIDI(take) then return item, take end
     end
     return nil, nil
 end
@@ -1161,8 +1239,9 @@ end
 local function FormatResult(res, action, cleared, pitch_stats)
     local lines = {
         ('%s: %d notes'):format(action, #res.notes),
-        ('Range: %.3fs - %.3fs (%.3fs)%s'):format(
-            res.range_start, res.range_end, res.range_end - res.range_start,
+        ('Range: %s — %s  (%.3fs)%s'):format(
+            FormatTime(res.range_start), FormatTime(res.range_end),
+            res.range_end - res.range_start,
             res.has_selection and ' [time selection]' or ' [whole item]'),
     }
     if res.splits > 0 then
@@ -1464,6 +1543,37 @@ local function ResolveApplyPitchTracks()
 end
 
 ----------------------------------------------------------------------
+-- Lyrics helpers
+----------------------------------------------------------------------
+local function ParseLyricsFile(path)
+    local f = io.open(path, 'r')
+    if not f then return nil, 'Could not open file:\n' .. path end
+    local content = f:read('*all')
+    f:close()
+    content = content:gsub('%b[]', '')  -- strip [comment] blocks
+    local words = {}
+    for w in content:gmatch('%S+') do words[#words + 1] = w end
+    if #words == 0 then
+        return nil, 'No lyrics found in file (after stripping comments).'
+    end
+    return words
+end
+
+-- Remove all type-5 (lyric) text events from a take, preserving LYRIC_IGNORE entries.
+local function ClearLyricEvents(midi_take)
+    local _, _, _, n_text = r.MIDI_CountEvts(midi_take)
+    local removed = 0
+    for i = n_text - 1, 0, -1 do
+        local ok, _, _, _, typ, msg = r.MIDI_GetTextSysexEvt(midi_take, i)
+        if ok and typ == 5 and not LYRIC_IGNORE[msg] then
+            r.MIDI_DeleteTextSysexEvt(midi_take, i)
+            removed = removed + 1
+        end
+    end
+    return removed
+end
+
+----------------------------------------------------------------------
 -- Actions
 ----------------------------------------------------------------------
 local function Preview()
@@ -1501,7 +1611,7 @@ local function Generate()
         S.status = 'Error'
         S.last_result =
             'No MIDI item on the destination track covers the analysis range.\n' ..
-            ('Required coverage: %.3fs - %.3fs\n'):format(range_info.range_start, range_info.range_end) ..
+            ('Required coverage: %s — %s\n'):format(FormatTime(range_info.range_start), FormatTime(range_info.range_end)) ..
             'Create or extend a MIDI item on that track to span the range.'
         return
     end
@@ -1630,8 +1740,8 @@ local function ApplyPitchChangesAction()
 
     if #existing == 0 then
         S.status = 'No notes in range.'
-        S.last_result = ('Range: %.3fs - %.3fs%s\nNothing to update.'):format(
-            target.range_start, target.range_end,
+        S.last_result = ('Range: %s — %s%s\nNothing to update.'):format(
+            FormatTime(target.range_start), FormatTime(target.range_end),
             target.has_selection and ' [time selection]' or ' [whole MIDI item]')
         return
     end
@@ -1680,8 +1790,8 @@ local function ApplyPitchChangesAction()
     local lines = {
         ('Apply pitch changes: %d notes processed, %d pitches changed')
             :format(#existing, changed),
-        ('Range: %.3fs - %.3fs (%.3fs)%s'):format(
-            target.range_start, target.range_end,
+        ('Range: %s — %s  (%.3fs)%s'):format(
+            FormatTime(target.range_start), FormatTime(target.range_end),
             target.range_end - target.range_start,
             target.has_selection and ' [time selection]' or ' [whole MIDI item]'),
     }
@@ -1698,6 +1808,169 @@ local function ApplyPitchChangesAction()
     end
 
     S.status = 'Pitches applied.'
+    S.last_result = table.concat(lines, '\n')
+end
+
+local function ClearLyricsAction()
+    local tracks = GetTrackList()
+    if #tracks == 0 or S.midi_idx >= #tracks then
+        S.status = 'Error'; S.last_result = 'Invalid MIDI destination track.'; return
+    end
+    local midi_track = r.GetTrack(0, tracks[S.midi_idx + 1].idx)
+    local _, midi_take = FindFirstMIDIItem(midi_track)
+    if not midi_take then
+        S.status = 'Error'
+        S.last_result = 'No MIDI item found on the destination track.'
+        return
+    end
+
+    r.PreventUIRefresh(1)
+    r.Undo_BeginBlock()
+    local cleared = ClearLyricEvents(midi_take)
+    r.MIDI_Sort(midi_take)
+    r.Undo_EndBlock(('Vocal MIDI: cleared %d lyric events'):format(cleared), -1)
+    r.PreventUIRefresh(-1)
+
+    S.status = ('Cleared %d lyric events.'):format(cleared)
+    S.last_result = nil
+end
+
+local function AssignLyricsAction()
+    if S.lyrics_path == '' then
+        S.status = 'No lyrics file selected.'
+        S.last_result = 'Use Auto-detect or Browse to select a lyrics file first.'
+        return
+    end
+
+    local lyrics, lerr = ParseLyricsFile(S.lyrics_path)
+    if not lyrics then S.status = 'Error'; S.last_result = lerr; return end
+
+    local tracks = GetTrackList()
+    if #tracks == 0 or S.midi_idx >= #tracks then
+        S.status = 'Error'; S.last_result = 'Invalid MIDI destination track.'; return
+    end
+    local midi_track = r.GetTrack(0, tracks[S.midi_idx + 1].idx)
+    local _, midi_take = FindFirstMIDIItem(midi_track)
+    if not midi_take then
+        S.status = 'Error'
+        S.last_result = 'No MIDI item found on the destination track.'
+        return
+    end
+
+    local sel_s, sel_e = GetTimeSelection()
+
+    -- Read all notes: vocal range + phrase markers
+    local all_vocal = {}
+    local phrase_markers = {}
+    local _, n_notes = r.MIDI_CountEvts(midi_take)
+    for i = 0, n_notes - 1 do
+        local ok, _, _, sppq, eppq, _, p = r.MIDI_GetNote(midi_take, i)
+        if ok then
+            local s_t = r.MIDI_GetProjTimeFromPPQPos(midi_take, sppq)
+            local e_t = r.MIDI_GetProjTimeFromPPQPos(midi_take, eppq)
+            if p >= RB3_MIN_PITCH and p <= RB3_MAX_PITCH then
+                all_vocal[#all_vocal + 1] = { s = s_t, e = e_t }
+            elseif p == RB3_PHRASE_PITCH then
+                phrase_markers[#phrase_markers + 1] = { s = s_t }
+            end
+        end
+    end
+    table.sort(all_vocal,      function(a, b) return a.s < b.s end)
+    table.sort(phrase_markers, function(a, b) return a.s < b.s end)
+
+    -- Scope to time selection if present
+    local scoped
+    if sel_s then
+        scoped = {}
+        for _, n in ipairs(all_vocal) do
+            if n.s >= sel_s - 0.001 and n.s < sel_e + 0.001 then
+                scoped[#scoped + 1] = n
+            end
+        end
+    else
+        scoped = all_vocal
+    end
+
+    if #scoped == 0 then
+        S.status = 'No notes in range.'
+        S.last_result = 'No notes in the RB3 vocal range found' ..
+            (sel_s and (' within time selection (%s — %s).'):format(FormatTime(sel_s), FormatTime(sel_e)) or '.')
+        return
+    end
+
+    r.PreventUIRefresh(1)
+    r.Undo_BeginBlock()
+
+    local cleared = ClearLyricEvents(midi_take)
+
+    local assigned = {}  -- { s, lyric } for validation
+    local inserted = 0
+    for i, n in ipairs(scoped) do
+        local lyric = lyrics[i]
+        if lyric then
+            local ppq = r.MIDI_GetPPQPosFromProjTime(midi_take, n.s)
+            r.MIDI_InsertTextSysexEvt(midi_take, false, false, ppq, 5, lyric)
+            inserted = inserted + 1
+        end
+        assigned[i] = { s = n.s, lyric = lyric }
+    end
+    r.MIDI_Sort(midi_take)
+    r.Undo_EndBlock(('Vocal MIDI: assigned %d lyrics'):format(inserted), -1)
+    r.PreventUIRefresh(-1)
+
+    -- Build result
+    local lines = {}
+    lines[#lines + 1] = ('Lyrics assigned: %d syllables added'):format(inserted)
+    if sel_s then
+        lines[#lines + 1] = ('Scope: time selection %s — %s'):format(FormatTime(sel_s), FormatTime(sel_e))
+    else
+        lines[#lines + 1] = 'Scope: whole take'
+    end
+    lines[#lines + 1] = ('Cleared %d existing lyric events first'):format(cleared)
+
+    -- Count mismatch
+    local n_notes_in = #scoped
+    local n_lyrics_in = #lyrics
+    if n_notes_in ~= n_lyrics_in then
+        lines[#lines + 1] = ''
+        if n_notes_in > n_lyrics_in then
+            lines[#lines + 1] = ('Warning: %d notes, %d lyrics — last %d notes have no lyric')
+                :format(n_notes_in, n_lyrics_in, n_notes_in - n_lyrics_in)
+        else
+            lines[#lines + 1] = ('Warning: %d notes, %d lyrics — last %d lyrics are unused')
+                :format(n_notes_in, n_lyrics_in, n_lyrics_in - n_notes_in)
+        end
+    end
+
+    -- Phrase capitalization check
+    lines[#lines + 1] = ''
+    if #phrase_markers == 0 then
+        lines[#lines + 1] = 'Phrase markers: none found — cannot validate capitalization.'
+    else
+        local violations = {}
+        for _, pm in ipairs(phrase_markers) do
+            for _, a in ipairs(assigned) do
+                if a.s >= pm.s - 0.001 and a.lyric then
+                    local first = a.lyric:sub(1, 1)
+                    if first ~= first:upper() then
+                        violations[#violations + 1] = { s = a.s, lyric = a.lyric }
+                    end
+                    break
+                end
+            end
+        end
+        if #violations == 0 then
+            lines[#lines + 1] = ('Phrase capitalization: OK — all %d phrases start with a capital letter.')
+                :format(#phrase_markers)
+        else
+            lines[#lines + 1] = ('Phrase capitalization: %d violation(s):'):format(#violations)
+            for _, v in ipairs(violations) do
+                lines[#lines + 1] = ('  %s  "%s"'):format(FormatTime(v.s), v.lyric)
+            end
+        end
+    end
+
+    S.status = ('Lyrics assigned: %d notes.'):format(inserted)
     S.last_result = table.concat(lines, '\n')
 end
 
@@ -1728,11 +2001,13 @@ local function Loop()
         S.audio_idx   = 0
         S.midi_idx    = 0
         S.ref_idx     = 0
+        S.lyrics_path = ''
         S.last_result = nil
         local loaded = LoadSettings()
         S.status = loaded and 'Project switched: loaded saved settings.'
                            or 'Project switched.'
         SetDefaultTracks()
+        AutoDetectLyricsFile()
     end
 
     local tracks = GetTrackList()
@@ -1760,6 +2035,10 @@ local function Loop()
         local bw_gen = r.ImGui_CalcTextSize(ctx, 'Generate notes (append)') + _bp
         local bw_app = r.ImGui_CalcTextSize(ctx, 'Apply pitch changes') + _bp
         local bw_und = r.ImGui_CalcTextSize(ctx, 'Undo') + _bp
+        local bw_lad = r.ImGui_CalcTextSize(ctx, 'Auto-detect') + _bp
+        local bw_lbr = r.ImGui_CalcTextSize(ctx, 'Browse...') + _bp
+        local bw_lcl = r.ImGui_CalcTextSize(ctx, 'Clear lyrics') + _bp
+        local bw_las = r.ImGui_CalcTextSize(ctx, 'Assign lyrics') + _bp
         if r.ImGui_Button(ctx, 'Auto-tune from reference', bw_at, 24) then
             RunAutoTune()
         end
@@ -1913,7 +2192,7 @@ local function Loop()
         r.ImGui_Separator(ctx)
         r.ImGui_Text(ctx, 'Actions')
         if sel_s then
-            r.ImGui_Text(ctx, ('Time selection: %.3fs – %.3fs'):format(sel_s, sel_e))
+            r.ImGui_Text(ctx, ('Time selection: %s — %s'):format(FormatTime(sel_s), FormatTime(sel_e)))
         else
             r.ImGui_TextDisabled(ctx, 'No time selection — whole audio item will be analysed')
         end
@@ -1952,6 +2231,82 @@ local function Loop()
         end
         if not can_undo then r.ImGui_EndDisabled(ctx) end
         if can_undo then Tooltip('Undo: ' .. undo_str) end
+
+        ----------------------------------------------------------------
+        -- Lyrics
+        ----------------------------------------------------------------
+        r.ImGui_Separator(ctx)
+        r.ImGui_Text(ctx, 'Lyrics')
+
+        local lyric_basename = S.lyrics_path ~= ''
+            and (S.lyrics_path:match('[/\\]([^/\\]+)$') or S.lyrics_path)
+            or '(no file selected)'
+        r.ImGui_TextDisabled(ctx, 'File: ' .. lyric_basename)
+        if S.lyrics_path ~= '' then Tooltip(S.lyrics_path) end
+
+        if r.ImGui_Button(ctx, 'Auto-detect', bw_lad, 24) then
+            local proj_path = r.GetProjectPath('')
+            if proj_path and proj_path ~= '' then
+                local sep = (proj_path:sub(-1) == '/' or proj_path:sub(-1) == '\\') and '' or '/'
+                local candidate = proj_path .. sep .. 'lyrics.txt'
+                local f = io.open(candidate, 'r')
+                if f then
+                    f:close()
+                    S.lyrics_path = candidate
+                    S.status = 'Lyrics file found: lyrics.txt'
+                    S.last_result = nil
+                else
+                    S.status = 'No lyrics.txt found in project folder.'
+                    S.last_result = nil
+                end
+            else
+                S.status = 'Project has no saved path — save the project first.'
+                S.last_result = nil
+            end
+        end
+        Tooltip(TIPS.lyrics_auto_detect)
+
+        r.ImGui_SameLine(ctx)
+        if r.ImGui_Button(ctx, 'Browse...', bw_lbr, 24) then
+            _browse_tooltip_suppressed = true
+            local proj_path = r.GetProjectPath('')
+            local start = ''
+            if proj_path and proj_path ~= '' then
+                local sep = (proj_path:sub(-1) == '/' or proj_path:sub(-1) == '\\') and '' or '\\'
+                start = proj_path .. sep
+            end
+            local ok, path = r.GetUserFileNameForRead(start, 'Select lyrics file', 'txt')
+            if ok and path and path ~= '' then
+                if not path:match('%.[Tt][Xx][Tt]$') then
+                    S.status = 'Invalid file — please select a .txt file.'
+                    S.last_result = nil
+                else
+                    S.lyrics_path = path
+                    S.status = 'Lyrics file: ' .. (path:match('[/\\]([^/\\]+)$') or path)
+                    S.last_result = nil
+                end
+            end
+        end
+        if r.ImGui_IsItemHovered(ctx) and not r.ImGui_IsItemActive(ctx) and not _browse_tooltip_suppressed then
+            r.ImGui_SetTooltip(ctx, TIPS.lyrics_browse)
+        elseif not r.ImGui_IsItemHovered(ctx) then
+            _browse_tooltip_suppressed = false
+        end
+
+        r.ImGui_SameLine(ctx)
+        if r.ImGui_Button(ctx, 'Clear lyrics', bw_lcl, 24) then
+            ClearLyricsAction()
+        end
+        Tooltip(TIPS.lyrics_clear)
+
+        local assign_disabled = (S.lyrics_path == '')
+        r.ImGui_SameLine(ctx)
+        if assign_disabled then r.ImGui_BeginDisabled(ctx) end
+        if r.ImGui_Button(ctx, 'Assign lyrics', bw_las, 24) then
+            AssignLyricsAction()
+        end
+        if assign_disabled then r.ImGui_EndDisabled(ctx) end
+        Tooltip(TIPS.lyrics_assign)
 
         r.ImGui_Spacing(ctx)
         r.ImGui_Text(ctx, S.status)

@@ -85,20 +85,25 @@ The script is organized top-to-bottom in this order. Keep additions in their nat
 1.  @description / @version / @about header
 2.  ReaImGui dependency check
 3.  Mode constants                 MODE_SINGLE / MODE_REFERENCE / MODE_YIN
+                                   RB3_MIN_PITCH, RB3_MAX_PITCH, RB3_PHRASE_PITCH
+                                   LYRIC_IGNORE (special text events to preserve)
 4.  DEFAULTS table                 single source of truth for defaults
 5.  S table                        live state (mutated by sliders & actions)
+                                   includes S.lyrics_path (session-only, not saved)
 6.  ResetXxx() functions           per-section resets to factory defaults
 7.  Settings save/load             SerializeSettings, DeserializeSettings,
                                    SaveSettings, LoadSettings
                                    + auto-load on script open
 8.  TIPS table                     all tooltip text in one place
 9.  Helpers                        PitchName, Tooltip, SliderTooltip,
-                                   GetTrackList, TrackCombo, GetTimeSelection
+                                   FormatTime, GetTrackList, TrackCombo,
+                                   GetTimeSelection, TrackHasAudio, TrackHasMIDI,
+                                   SetDefaultTracks, AutoDetectLyricsFile
 10. Range/target resolution        ResolveAnalysisRange,
-                                   ResolveApplyPitchTarget,
-                                   FindMIDIItem
+                                   FindMIDIItem, FindFirstMIDIItem,
+                                   ResolveApplyPitchTarget
 11. MIDI reading                   ReadAllMIDINotesOnTrack,
-                                   ReadReferenceNotes,
+                                   ReadReferenceNotes, ReadAutoTuneRefNotes,
                                    FindNearestRefPitch
 12. Pitch helpers                  ApplyPitchRange,
                                    ClearNotesAtPitchesInRange
@@ -111,12 +116,13 @@ The script is organized top-to-bottom in this order. Keep additions in their nat
 16. Auto-tune                      EvaluateParams, AutoTune,
                                    ApplyAutoTuneResult, ScoreNotes
 17. Insert helpers                 InsertNotes
-18. Track resolution               ResolveTracks, ResolveApplyPitchTracks,
-                                   SetDefaultTracks
-19. Actions                        Preview, Generate, RunAutoTune,
-                                   ApplyPitchChangesAction
-20. UI                             SectionHeader, Loop
-21. r.defer(Loop)                  start
+18. Lyrics helpers                 ParseLyricsFile, ClearLyricEvents
+19. Track resolution               ResolveTracks, ResolveApplyPitchTracks
+20. Actions                        Preview, Generate, RunAutoTune,
+                                   ApplyPitchChangesAction,
+                                   ClearLyricsAction, AssignLyricsAction
+21. UI                             SectionHeader, Loop
+22. r.defer(Loop)                  start
 ```
 
 ---
@@ -152,6 +158,36 @@ The script is organized top-to-bottom in this order. Keep additions in their nat
 ### Pitch range constraints
 
 Two checkbox+slider pairs (min and max). When a pitch falls outside the range, the script first tries octave-shifting it back into range (±12 at a time, up to 16 attempts). If the range is narrower than 12 semitones and no octave fits, it clamps to the nearer endpoint. This is mainly for fixing octave-error artifacts from AI stem separation. The `range_adjusted` count appears in the result panel when non-zero.
+
+### Lyrics section
+
+A section below MIDI output for assigning lyric text events to the destination MIDI item.
+
+**File selection** — `S.lyrics_path` holds the current file path for the session (not persisted to project state). On script open and project switch, `AutoDetectLyricsFile` checks for `lyrics.txt` in the project folder and sets the path automatically if found. **Browse...** opens a native file picker filtered to `.txt` starting in the project folder; non-`.txt` selections are rejected with an error message.
+
+**Clear lyrics** — removes all type-5 (lyric) MIDI text events from the entire destination MIDI take, preserving entries in `LYRIC_IGNORE`. Always operates on the whole take regardless of time selection. Wrapped in an undo block.
+
+**Assign lyrics** — clears first (same ignore list), then assigns words from the file to notes in order:
+1. Reads the file, strips `[...]` comment blocks, splits on any whitespace.
+2. Reads all notes from the destination take. Notes in the RB3 vocal range (36–84) become candidates. Notes at `RB3_PHRASE_PITCH` (105) are collected separately for validation.
+3. If a time selection is active, only notes within it receive lyrics. Without a selection, all vocal-range notes on the take are used.
+4. Inserts one type-5 text event at the PPQ start of each candidate note, in start-time order.
+5. Reports to the result panel: syllables added, scope, count-mismatch warning if notes ≠ lyrics, and phrase capitalization check.
+
+**Phrase capitalization check** — for each phrase marker note (pitch 105), finds the first scoped note whose start time is at or after the marker's start, and checks that its assigned lyric starts with an uppercase letter. Reports each violation as `mNN  Xm SS.MMMsec  "word"` so the user can navigate directly in REAPER.
+
+**Lyric file format** — plain text. Words separated by any whitespace (spaces, tabs, newlines). `[anything in brackets]` is stripped before splitting, so section headers like `[chorus]` are ignored.
+
+**`LYRIC_IGNORE`** — module-level constant table of special game text events that both Clear and Assign preserve:
+```lua
+local LYRIC_IGNORE = {
+    ['[tambourine_start]'] = true, ['[tambourine_end]'] = true,
+    ['[cowbell_start]']    = true, ['[cowbell_end]']    = true,
+    ['[clap_start]']       = true, ['[clap_end]']       = true,
+}
+```
+
+**`FindFirstMIDIItem(track)`** — simpler variant of `FindMIDIItem`. Returns the first MIDI item on the track with no range-coverage requirement. Used by the lyrics actions because lyrics typically span the whole song and don't need the item to cover a specific analysis range.
 
 ### Save / Load
 
@@ -201,6 +237,15 @@ The Loop function compares the current REAPER project pointer (`EnumProjects(-1)
 ### 11. Button widths are text-derived, not fixed
 All action and auto-tune buttons use `r.ImGui_CalcTextSize(ctx, label) + _bp` for their width (where `_bp = 40`, giving ~20 px padding on each side). This keeps buttons visually consistent regardless of DPI or font size changes, without hardcoding pixel widths.
 
+### 12. Lyrics path is session-only, not persisted
+`S.lyrics_path` is not written to `SerializeSettings`. Reasoning: file paths are machine-specific and change frequently during authoring; persisting a stale path would cause confusing "file not found" errors on next open more often than it would save a click. Auto-detect (`lyrics.txt` in project folder) plus Browse cover the two main workflows without persistence.
+
+### 13. Clear lyrics always operates on the whole take
+`ClearLyricsAction` ignores time selection and always clears all lyric events from the take. Reasoning: lyric events for the ignored special game events (`[tambourine_start]` etc.) can live anywhere on the take; scoping to selection would require knowing their positions relative to the vocal notes. Clearing the whole take and reinserting is the simplest safe approach. The RB3 vocal range filter and `LYRIC_IGNORE` table together protect all non-lyric content.
+
+### 14. `FormatTime` uses REAPER's own measure formatter
+`r.format_timestr_pos(t, '', 1)` returns the project time in REAPER's measures/beats format (e.g. `"90.1.00"`). The measure number is parsed from the leading digits. This respects arbitrary tempo and time-signature changes in the project without needing to implement measure math manually. Falls back to plain `Xm SS.MMMsec` if parsing fails. Durations (range lengths) are left in plain seconds since they are not positions to navigate to.
+
 ---
 
 ## Conventions
@@ -240,6 +285,11 @@ All action and auto-tune buttons use `r.ImGui_CalcTextSize(ctx, label) + _bp` fo
 - `MIDI_GetNote` returns `(ok, sel, mute, sppq, eppq, chan, pitch, vel)`. Use named locals.
 - After `MIDI_DeleteNote`, indices of remaining notes shift — iterate **in reverse** when deleting.
 - After `MIDI_InsertNote` / `SetNote` with `noSort=true`, call `MIDI_Sort` once at the end.
+- `MIDI_CountEvts(take)` returns `(retval, notecnt, ccevtcnt, textsyxevtcnt)` — the **fourth** value is the text/sysex event count. The third is CC count, a common mistake.
+- `MIDI_GetTextSysexEvt(take, i)` returns `(ok, sel, mute, ppq, type, msg)`. Type 5 = lyric event.
+- `MIDI_InsertTextSysexEvt(take, sel, mute, ppq, type, text)` — use type 5 for lyrics.
+- `MIDI_DeleteTextSysexEvt` shifts indices like `MIDI_DeleteNote` — always iterate in reverse.
+- `format_timestr_pos(tpos, '', mode)` returns a formatted string. Mode 1 = measures/beats (e.g. `"90.1.00"`). Useful for display; parse the leading integer for the measure number.
 
 ---
 
@@ -323,12 +373,26 @@ No test framework — REAPER scripts are tested by running them. Manual checks I
 - [ ] Project switch: switching REAPER tabs clears track selections, loads the new project's saved settings, and re-runs smart defaults.
 - [ ] Undo button: disabled when nothing to undo; shows the operation label in tooltip; actually undoes the last action.
 - [ ] Long files (full song) don't crash; auto-tune freeze is bearable.
+- [ ] Lyrics — Auto-detect finds `lyrics.txt` in the project folder on script open and sets the path silently.
+- [ ] Lyrics — Browse opens in the project folder; selecting a non-.txt file shows an error and does not set the path.
+- [ ] Lyrics — Clear lyrics removes all type-5 events except the LYRIC_IGNORE entries; produces a correct undo entry.
+- [ ] Lyrics — Assign lyrics with no time selection assigns to all vocal-range notes on the take.
+- [ ] Lyrics — Assign lyrics with a time selection assigns only to notes within the selection.
+- [ ] Lyrics — Assign lyrics clears existing lyrics first (including partial re-runs don't stack duplicates).
+- [ ] Lyrics — Count mismatch warning appears correctly when notes > lyrics and lyrics > notes.
+- [ ] Lyrics — Phrase capitalization check reports "none found" when no pitch-105 notes exist.
+- [ ] Lyrics — Phrase capitalization check reports all violations with correct timestamps when first-phrase words are lowercase.
+- [ ] Lyrics — Phrase capitalization check reports OK when all phrases start with uppercase.
+- [ ] Lyrics — Assign lyrics is greyed out when no file is selected; becomes active after auto-detect or browse.
+- [ ] Timestamps in result panel show measure number and correct mm:ss format for positions ≥ 60 s.
 
 ---
 
 ## Things on the radar
 
 Not in scope right now but worth keeping in mind so we don't paint ourselves into a corner:
+
+- **`_temp/` standalone scripts superseded.** `prepare_lyric_import.lua` and `import_lyrics_ignoring_comments.lua` are now replaced by the integrated Lyrics section. They can be kept for reference or deleted; they are no longer part of the workflow.
 
 - **Coroutine-based auto-tune progress bar.** Would eliminate the UI freeze during parameter search. Blocked by REAPER API restriction: `GetAudioAccessorSamples` and `new_array` return nil when called from a Lua coroutine. Needs either a workaround (pre-compute contour before entering coroutine) or a different approach (incremental state machine in the main loop).
 - **Multi-item audio support.** If the vocal stem is split into multiple items, currently only the first (or the overlapping one) is processed.
