@@ -41,6 +41,10 @@ local MODE_SINGLE    = 0
 local MODE_REFERENCE = 1
 local MODE_YIN       = 2
 
+-- Rock Band 3 vocal note range. Notes outside this are phrase/overdrive markers.
+local RB3_MIN_PITCH = 36  -- C1
+local RB3_MAX_PITCH = 84  -- C5
+
 ----------------------------------------------------------------------
 -- Defaults & state
 ----------------------------------------------------------------------
@@ -58,7 +62,7 @@ local DEFAULTS = {
     min_pitch_enabled = false,
     min_pitch         = 48,
     max_pitch_enabled = false,
-    max_pitch         = 84,
+    max_pitch         = 72,
 
     yin_threshold     = 0.15,
     yin_min_freq      = 80,
@@ -677,6 +681,38 @@ local function ReadReferenceNotes(midi_take, pitch, range_start, range_end)
     return notes
 end
 
+-- Read all vocal-range notes for auto-tune: pitch-agnostic, deduplicates
+-- stacked notes (keeps the lowest pitch when notes share a start time).
+local function ReadAutoTuneRefNotes(midi_take, range_start, range_end)
+    local raw = {}
+    local _, n_notes = r.MIDI_CountEvts(midi_take)
+    for i = 0, n_notes - 1 do
+        local ok, _, _, sppq, eppq, _, p = r.MIDI_GetNote(midi_take, i)
+        if ok and p >= RB3_MIN_PITCH and p <= RB3_MAX_PITCH then
+            local s_t = r.MIDI_GetProjTimeFromPPQPos(midi_take, sppq)
+            local e_t = r.MIDI_GetProjTimeFromPPQPos(midi_take, eppq)
+            if s_t < range_end and e_t > range_start then
+                raw[#raw + 1] = { s = s_t, e = e_t, pitch = p }
+            end
+        end
+    end
+    -- Sort by start time; within same start time sort lowest pitch first.
+    table.sort(raw, function(a, b)
+        if math.abs(a.s - b.s) < 0.01 then return a.pitch < b.pitch end
+        return a.s < b.s
+    end)
+    -- Deduplicate: skip any note whose start is within 10 ms of the last kept note.
+    local notes = {}
+    local last_s = -math.huge
+    for _, n in ipairs(raw) do
+        if n.s - last_s >= 0.01 then
+            notes[#notes + 1] = { s = n.s, e = n.e }
+            last_s = n.s
+        end
+    end
+    return notes
+end
+
 ----------------------------------------------------------------------
 -- Find the nearest reference pitch to a given time, within tolerance
 ----------------------------------------------------------------------
@@ -713,7 +749,7 @@ local function ApplyPitchRange(pitch, min_p, max_p)
     end
     if min_p and p < min_p then p = min_p end
     if max_p and p > max_p then p = max_p end
-    if p < 0 then p = 0 elseif p > 127 then p = 127 end
+    if p < RB3_MIN_PITCH then p = RB3_MIN_PITCH elseif p > RB3_MAX_PITCH then p = RB3_MAX_PITCH end
     return p
 end
 
@@ -725,7 +761,7 @@ local function ClearNotesAtPitchesInRange(midi_take, pitch_set, range_start, ran
     local removed = 0
     for i = n_notes - 1, 0, -1 do
         local ok, _, _, sppq, eppq, _, p = r.MIDI_GetNote(midi_take, i)
-        if ok and pitch_set[p] then
+        if ok and pitch_set[p] and p >= RB3_MIN_PITCH and p <= RB3_MAX_PITCH then
             local s_t = r.MIDI_GetProjTimeFromPPQPos(midi_take, sppq)
             local e_t = r.MIDI_GetProjTimeFromPPQPos(midi_take, eppq)
             if s_t < range_end and e_t > range_start then
@@ -1239,12 +1275,11 @@ local function EvaluateParams(contour_cache, range_info, params)
 end
 
 local function AutoTune(range_info, midi_take)
-    local ref_notes = ReadReferenceNotes(midi_take, S.pitch,
+    local ref_notes = ReadAutoTuneRefNotes(midi_take,
         range_info.range_start, range_info.range_end)
     if #ref_notes == 0 then
-        return nil, ('No reference notes at pitch %d (%s) in the time selection.\n')
-            :format(S.pitch, PitchName(S.pitch)) ..
-            'Place a few notes manually first, then run Auto-tune.'
+        return nil, 'No notes in the time selection to use as reference.\n' ..
+            'Place a few notes manually on the destination MIDI item first, then run Auto-tune.'
     end
 
     local cache = {}
@@ -1781,7 +1816,7 @@ local function Loop()
         Tooltip(TIPS.pitch_mode_yin)
 
         local pfmt = ('%%d  (%s)'):format(PitchName(S.pitch))
-        _, S.pitch = r.ImGui_SliderInt(ctx, 'Default pitch', S.pitch, 0, 127, pfmt)
+        _, S.pitch = r.ImGui_SliderInt(ctx, 'Default pitch', S.pitch, RB3_MIN_PITCH, RB3_MAX_PITCH, pfmt)
         SliderTooltip(TIPS.pitch)
 
         local ref_disabled = (S.pitch_mode ~= MODE_REFERENCE)
@@ -1827,7 +1862,7 @@ local function Loop()
         r.ImGui_SameLine(ctx)
         if not S.min_pitch_enabled then r.ImGui_BeginDisabled(ctx) end
         local minfmt = ('%%d  (%s)'):format(PitchName(S.min_pitch))
-        _, S.min_pitch = r.ImGui_SliderInt(ctx, 'Min pitch', S.min_pitch, 0, 127, minfmt)
+        _, S.min_pitch = r.ImGui_SliderInt(ctx, 'Min pitch', S.min_pitch, RB3_MIN_PITCH, RB3_MAX_PITCH, minfmt)
         SliderTooltip(TIPS.min_pitch)
         if not S.min_pitch_enabled then r.ImGui_EndDisabled(ctx) end
 
@@ -1836,7 +1871,7 @@ local function Loop()
         r.ImGui_SameLine(ctx)
         if not S.max_pitch_enabled then r.ImGui_BeginDisabled(ctx) end
         local maxfmt = ('%%d  (%s)'):format(PitchName(S.max_pitch))
-        _, S.max_pitch = r.ImGui_SliderInt(ctx, 'Max pitch', S.max_pitch, 0, 127, maxfmt)
+        _, S.max_pitch = r.ImGui_SliderInt(ctx, 'Max pitch', S.max_pitch, RB3_MIN_PITCH, RB3_MAX_PITCH, maxfmt)
         SliderTooltip(TIPS.max_pitch)
         if not S.max_pitch_enabled then r.ImGui_EndDisabled(ctx) end
 
