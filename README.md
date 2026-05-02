@@ -1,6 +1,12 @@
 # Vocal MIDI Generator
 
-A REAPER ReaScript that analyses a vocal audio track and generates MIDI notes aligned to the syllables and phrases it detects, then assigns lyrics to those notes. Designed for authoring timing and lyric data for rhythm/karaoke games.
+**Generate timing-aligned MIDI notes from a vocal stem, with lyric assignment built in.** A REAPER ReaScript that analyses a vocal audio track and generates MIDI notes aligned to the syllables and phrases it detects, then assigns lyrics to those notes.
+
+Designed for authoring Rock Band-style vocal charts — it defaults to the RB3 vocal pitch range (C1–C5) and the standard phrase-marker convention (pitch 105) — but the timing detection and lyric assignment work for any rhythm/karaoke MIDI workflow.
+
+<!-- TODO: replace with a 10–15 s GIF showing dry run → generate → assign lyrics -->
+
+![Demo](assets/demo.gif)
 
 ---
 
@@ -22,7 +28,7 @@ A REAPER ReaScript that analyses a vocal audio track and generates MIDI notes al
 ## Quick start
 
 1. Open a REAPER project containing a vocal stem on one track and a destination track with a MIDI item on it.
-2. Run the script. The script window opens and attempts to auto-select the right tracks (it looks for tracks named `VOCALS AUDIO` / `DRYVOX1` for audio and `PART VOCALS` for MIDI destination).
+2. Run the script. The window opens and attempts to auto-select the right tracks (it looks for tracks named `VOCALS AUDIO` / `DRYVOX1` for audio and `PART VOCALS` for MIDI destination).
 3. Confirm the track selections in the dropdowns if needed.
 4. Click **Dry run** to see how many notes would be detected with the current settings.
 5. Click **Generate notes (append)** to write the notes into your MIDI item.
@@ -54,7 +60,7 @@ You need two tracks before running the script:
 - **Audio source track** — contains the vocal stem (an isolated vocals-only audio file, e.g. from an AI stem separator like Demucs or UVR).
 - **MIDI destination track** — contains a MIDI item that spans the region you want to work on. The script writes into this existing item; it will not create a new one.
 
-Optionally, a third **Reference MIDI track** is needed if you use the Reference MIDI pitch source.
+If you plan to use **Reference MIDI** as the pitch source, add a third track containing the reference notes.
 
 ### Step 2 — (Optional) Make a time selection
 
@@ -112,6 +118,8 @@ The algorithm samples audio starting at 30% into each note (to avoid the attack 
 
 Two optional checkbox+slider pairs clamp or octave-shift pitches into a target range. When a detected pitch is outside the range, the script first tries octave-shifting it back in (±12 semitones, up to 16 attempts), then falls back to clamping. Useful for correcting octave errors from AI stem separation.
 
+> **Example:** Max pitch set to 72 (C5). A detected pitch of 84 (C6) is shifted down one octave to 72 — within range, accepted. A detected pitch of 86 with Min = 60 and Max = 72 has no octave that fits inside a 12-semitone window, so it clamps to the nearer endpoint (72).
+
 ### Step 5 — Dry run and Generate
 
 ![Action button section](assets/actions.jpg)
@@ -135,9 +143,12 @@ Auto-tune automates the process of finding Detection slider values that reproduc
 2. Make a time selection covering those reference notes.
 3. Click **Auto-tune from reference**.
 
-The script runs a coordinate descent search over the five detection parameters (RMS threshold, Low-pass cutoff, Peak-split ratio, Min offset, Min note length). It does not change pitch settings or RMS window. When it finishes, the sliders update to the best-found values and the result panel shows accuracy statistics.
+The script runs a coordinate descent search over five detection parameters (**RMS threshold**, **Low-pass cutoff**, **Peak-split ratio**, **Min offset**, **Min note length**) and leaves the rest alone. When it finishes, the sliders update to the best-found values and the result panel shows accuracy statistics.
 
-> **Note:** Auto-tune can take several seconds for longer sections. The UI will be unresponsive during the search — this is expected.
+**What auto-tune changes:** the five detection sliders listed above.
+**What it leaves alone:** RMS window (a resolution choice, not a fit-to-reference parameter), all pitch settings, velocity, and your reference notes themselves.
+
+> **Note:** Auto-tune can take several seconds for longer sections. The UI will be unresponsive during the search — this is expected (see [Known limitations](#known-limitations)).
 
 ---
 
@@ -157,6 +168,8 @@ The button is disabled when Pitch source is set to Single pitch (it would just o
 ![Lyrics section](assets/lyrics.jpg)
 
 The Lyrics section assigns words from a plain-text file to the MIDI notes on the destination track as lyric text events (the same format REAPER's native lyric tools use).
+
+> **Note on RB3 conventions:** Lyric assignment operates on notes within the RB3 vocal range (C1–C5, MIDI pitches 36–84), and the phrase capitalization check uses pitch 105 as the phrase-boundary marker. These are Rock Band 3 standards; if you author for a different game with a different convention, the script's behaviour here may need adjusting.
 
 ### Lyrics file format
 
@@ -240,6 +253,77 @@ Settings are loaded automatically when the script opens (if a save exists for th
 - **Auto-tune works best with 10–30 representative reference notes** covering the range of dynamics in the section.
 - **Finish timing and pitch before assigning lyrics.** Assign lyrics runs on notes as they are at the moment you click — if you later split, merge, or reorder notes, re-run Assign lyrics to realign the words. The whole-take clear-and-reassign approach keeps this safe and idempotent.
 - **Name your lyrics file `lyrics.txt` and save it in the project folder.** Auto-detect will find it every time you open the script or switch project tabs, saving you the Browse step entirely.
+
+---
+
+## Troubleshooting
+
+If something is going wrong, find the symptom below and try the suggested fixes.
+
+### Detection
+
+**Note starts land on consonants instead of vowels.**
+Enable the **Low-pass cutoff** at around 1500–2000 Hz. Sibilants (S, F, SH) carry significant energy at high frequencies, which can trigger detection slightly before the vowel begins. Filtering them out makes the detector "see" the vowel onset.
+
+**Quiet phrases are being missed entirely.**
+Lower the **RMS threshold** (try 0.02 or 0.01). If only specific phrases are quiet relative to the rest of the section, work that section separately with a time selection.
+
+**Too many false notes — breath noise, consonants, room tone trigger detections.**
+Raise the **RMS threshold**, raise **Min note length** to 80–120 ms, or both. Breath noise is usually short and low-energy; either of these filters should remove most of it.
+
+**Fast syllables are being merged into one long note.**
+Enable **Peak-split ratio**. Start at 40–50% and adjust. The split happens wherever the contour drops below `peak × ratio` within a phrase.
+
+**Notes are running into each other with no gap between them.**
+Raise **Min offset to next note**. The default of 100 ms is conservative; values up to 200–250 ms work well for slower vocals.
+
+**Auto-tune produces strange results.**
+Auto-tune fits to whatever timing reference notes you give it — if those notes are inaccurate or unrepresentative, the result will be too. Use 10–30 reference notes that cover the dynamic range of the section, and place them carefully.
+
+### Pitch
+
+**YIN reports lots of octave errors.**
+Tighten the **Min frequency** and **Max frequency** range to bracket the actual vocal range as closely as possible. As a fallback, enable the **Pitch range constraints** (min/max) — the script will octave-shift out-of-range pitches back in.
+
+**YIN falls back to Default pitch on most notes.**
+Raise the **YIN threshold** (try 0.2 or 0.25). The threshold is a confidence cutoff — too strict and the algorithm rejects valid detections.
+
+**Reference MIDI mode reports zero matches.**
+Check that the reference MIDI item actually overlaps the analysis range, and that the **Search tolerance** is wide enough (try 200–500 ms). If your reference is consistently early or late versus the audio, nudge the MIDI item in REAPER to align it.
+
+### Lyrics
+
+**Lyrics file isn't auto-detected.**
+The auto-detect looks for a file literally named `lyrics.txt` in the project folder. Check the filename (extension included) and the folder, or use **Browse...** to pick the file manually.
+
+**Count mismatch warning: more notes than lyrics.**
+The lyrics file has fewer syllables than there are notes in scope. Common causes: a multi-syllable word that should be split with hyphens (`won-` `der-` `ful` instead of `wonderful`), or an extra note that shouldn't be there.
+
+**Count mismatch warning: more lyrics than notes.**
+The opposite — usually a missed detection (try a lower RMS threshold) or two syllables incorrectly merged into one note (try peak-split).
+
+**Phrase capitalization check reports violations.**
+A phrase marker note (pitch 105) is followed by a lyric that starts with a lowercase letter. Either capitalize the lyric in your file or move the phrase marker — the result panel gives you the measure number and timestamp so you can navigate directly.
+
+---
+
+## Known limitations
+
+These are intentional trade-offs or REAPER API constraints, not bugs. Documented here so you know what to expect.
+
+1. **Auto-tune freezes the UI during the parameter search.** Single-threaded Lua, and REAPER's audio accessor APIs (`GetAudioAccessorSamples`, `new_array`) do not work reliably from a Lua coroutine — they return nil. A coroutine-based progress bar was attempted and reverted for this reason. Typical 20–40 second sections finish in a few seconds; full songs can take noticeably longer.
+
+2. **Apply pitch changes matches by note-start time only.** If you have manually shifted notes around significantly, a moved note will pull the pitch of whatever reference note is closest in time, which may not be the one you intended. Re-run timing detection if matching breaks down.
+
+3. **Peak-split uses the global per-phrase peak.** A phrase with one loud syllable (RMS 0.8) and one quiet one (RMS 0.3) at split ratio 50% will lose the quiet syllable, because the cut threshold (0.4) is above it. In practice vocals usually stay within ~2× dynamic range within a phrase, but uneven sections may need a lower split ratio or a manual fix.
+
+4. **Single audio item per audio track.** Without a time selection, only the first item on the audio track is analyzed. With a time selection, the script picks the item that overlaps. If your stem is split across multiple items, glue them first.
+
+5. **Reference MIDI alignment is the user's responsibility.** There is no automatic cross-correlation between detected onsets and reference onsets. If Basic Pitch's output is consistently early or late, nudge the MIDI item in REAPER or widen the Search tolerance.
+
+6. **Track selections are not persisted across sessions.** Track indices are positional and would be brittle to save. Smart defaults (matching `VOCALS AUDIO` / `PART VOCALS` track names) cover the common case; otherwise re-pick on each open.
+
+7. **YIN samples a fixed window at 30% into the note.** Works well for sustained vowels but may land on a consonant for very fast syllables. The 30% offset is a heuristic that avoids the attack transient while staying inside the note.
 
 ---
 
