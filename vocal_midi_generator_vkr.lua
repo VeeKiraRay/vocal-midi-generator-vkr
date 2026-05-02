@@ -1762,7 +1762,8 @@ local function ApplyPitchChangesAction()
             -- Process notes whose start falls in range. Avoids edge cases
             -- where a long note that just barely overlaps would also get
             -- updated even though the user probably didn't intend it.
-            if s_t >= target.range_start - 0.001 and s_t < target.range_end + 0.001 then
+            if s_t >= target.range_start - 0.001 and s_t < target.range_end + 0.001
+            and p >= RB3_MIN_PITCH and p <= RB3_MAX_PITCH then
                 existing[#existing + 1] = {
                     idx = i, s = s_t, e = e_t,
                     sppq = sppq, eppq = eppq,
