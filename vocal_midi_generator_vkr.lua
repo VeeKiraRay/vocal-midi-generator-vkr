@@ -32,6 +32,16 @@ if not r.ImGui_CreateContext then
     return
 end
 
+if not r.ImGui_BeginDisabled then
+    r.ShowMessageBox(
+        "This script requires ReaImGui 0.7 or later.\n\n" ..
+        "Update it via Extensions > ReaPack > Browse packages,\n" ..
+        "then search for 'ReaImGui' and update.",
+        "ReaImGui version too old", 0
+    )
+    return
+end
+
 local ctx = r.ImGui_CreateContext('Vocal MIDI Generator')
 
 ----------------------------------------------------------------------

@@ -12,8 +12,10 @@ Designed for authoring Rock Band-style vocal charts — it defaults to the RB3 v
 
 ## Requirements
 
-- [REAPER](https://www.reaper.fm/) (any recent version)
-- [ReaImGui](https://forum.cockos.com/showthread.php?t=250419) extension — install via **Extensions → ReaPack → Browse packages**, search for `ReaImGui`
+- [REAPER](https://www.reaper.fm/) **6.x or later**
+- [ReaImGui](https://forum.cockos.com/showthread.php?t=250419) **0.7 or later** (August 2022) — install via **Extensions → ReaPack → Browse packages**, search for `ReaImGui`
+
+The script checks both on startup: if ReaImGui is missing it shows an install prompt; if it is too old (pre-0.7, which lacks `ImGui_BeginDisabled`) it shows an update prompt.
 
 ---
 

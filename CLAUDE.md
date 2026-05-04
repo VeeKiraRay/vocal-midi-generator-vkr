@@ -10,7 +10,7 @@ This document is the canonical reference when working on the script. Read it bef
 
 **Purpose.** Take a vocal stem on one track, find where syllables/phrases occur, and write MIDI notes (timing-aligned, optionally pitch-aligned) into an existing MIDI item on another track. Used to author timing data for a karaoke game.
 
-**Runtime.** REAPER's embedded Lua. UI is ReaImGui (a hard dependency — the script bails on startup if it's missing).
+**Runtime.** REAPER's embedded Lua. UI is ReaImGui (a hard dependency — the script bails on startup if it's missing or too old). Requires **REAPER 6.x or later** and **ReaImGui 0.7 or later** (August 2022). The startup guard validates both: missing ReaImGui tests `ImGui_CreateContext`; outdated ReaImGui (pre-0.7) tests `ImGui_BeginDisabled`. All core REAPER APIs used (`new_array`, audio accessor, MIDI text events, `Undo_CanUndo2`) have been available since REAPER 5.x — the 6.x floor is set by ReaImGui's own requirements, not by any REAPER API the script calls directly.
 
 **Single-file by design choice.** REAPER Lua scripts *can* load other files via `dofile()` or `require()` (use `({reaper.get_action_context()})[2]` to get the current script's own path and derive sibling paths from it). We stay single-file for simpler distribution (one file to download and register) and because the shared state table `S`, the DSP pipeline, and the UI reference each other so heavily that splitting would add friction without meaningful benefit. Long file is fine; well-organized sections matter more than line count.
 
