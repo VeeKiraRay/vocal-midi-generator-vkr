@@ -34,6 +34,7 @@ The user's typical session:
 Two specialized actions exist outside that main loop:
 
 - **Auto-tune from reference.** User manually places a few notes at the Default pitch as a "ground truth" timing reference, makes a time selection over them, and hits Auto-tune. The script searches for detection parameters (coordinate descent) that best reproduce those reference notes, then applies them to the sliders. Doesn't change pitch settings or RMS window.
+- **Auto-tune YIN from reference.** User generates notes in YIN mode, manually corrects pitches on a handful of notes in the MIDI editor, makes a time selection over them, and clicks Auto-tune YIN. The script sweeps YIN parameter combinations (threshold, frequency range, window) scored against the corrected pitches, and applies the best-found values to the YIN sliders. Enabled only in YIN mode. Uses a CMND cache so most sweeps are pure in-memory scans with no audio I/O.
 - **Apply pitch changes.** Skips detection entirely. Reads the existing notes on the destination MIDI item and reassigns their pitches via the configured Pitch source, preserving position and length. Used after manual timing tweaks. Disabled in Single pitch mode.
 
 ---
@@ -112,13 +113,17 @@ The script is organized top-to-bottom in this order. Keep additions in their nat
                                    OpenYINContext, CloseYINContext,
                                    DetectPitchYIN
 14. Pipeline                       RunDetection, AssignPitches
-15. Result formatting              FormatResult, FormatAutoTuneResult
-16. Auto-tune                      EvaluateParams, AutoTune,
-                                   ApplyAutoTuneResult, ScoreNotes
+15. Result formatting              FormatResult, FormatAutoTuneResult,
+                                   FormatAutoTuneYINResult
+16. Auto-tune                      FineCandidates,
+                                   EvaluateParams, AutoTune,
+                                   ApplyAutoTuneResult, ScoreNotes,
+                                   AutoTuneYIN
 17. Insert helpers                 InsertNotes
 18. Lyrics helpers                 ParseLyricsFile, ClearLyricEvents
 19. Track resolution               ResolveTracks, ResolveApplyPitchTracks
 20. Actions                        Preview, Generate, RunAutoTune,
+                                   RunAutoTuneYIN,
                                    ApplyPitchChangesAction,
                                    ClearLyricsAction, AssignLyricsAction
 21. UI                             SectionHeader, Loop
@@ -154,6 +159,22 @@ The script is organized top-to-bottom in this order. Keep additions in their nat
 | **Min frequency (Hz)** | 40 – 400 | 80 Hz | Lower bound on detectable pitch. Sets the longest lag the algorithm searches. |
 | **Max frequency (Hz)** | 200 – 2000 | 1000 Hz | Upper bound on detectable pitch. Sets the shortest lag. Must be > Min frequency. |
 | **YIN window (ms)** | 10 – 100 | 30 ms | Length of audio analysed per note. Longer = more stable but misses short notes. Capped at 80% of the note length. |
+
+#### Auto-tune YIN from reference
+
+A button at the top of the YIN sub-section (enabled only when Pitch source = Built-in detection). Reads existing note positions from the MIDI destination item at the pitches the user has manually corrected, then sweeps combinations of the four YIN parameters and scores each against those reference pitches. The best-found values are applied to the sliders.
+
+**Pipeline.** Fixed timings — no re-detection. The note positions from the MIDI take are treated as ground truth; only pitch assignment (`AssignPitches`) is re-run for each candidate parameter set. Much lighter than detection auto-tune.
+
+**CMND cache.** Pre-computes CMND arrays per `window_ms` candidate. All threshold and frequency sweeps (the bulk of evaluations) scan the cached arrays with no audio I/O. Only a different `window_ms` forces a full CMND recompute. This is the direct analog of the detection auto-tune's contour cache.
+
+**Scoring.** Octave-insensitive pitch-class distance: `min(|ref - yin| mod 12, 12 - (|ref - yin| mod 12))`, range 0–6 per note. Fallback penalty = 6. Lower total = better. Ignoring octave is intentional — it separates pitch-class accuracy (what these parameters control) from octave correctness (what pitch range constraints fix).
+
+**Octave mismatch advisory.** After the best params are found, notes where pitch class matched but octave differed are counted. The result panel reports the count and suggests specific pitch range values derived from the reference note span: e.g. `"3 octave mismatches — reference spans C3–G4. Consider enabling pitch range: min 48 (C3), max 67 (G4)."` Does not auto-apply range constraints.
+
+**Parameters swept.** `yin_threshold`, `yin_min_hz`, `yin_max_hz`, `yin_window_ms`. Pitch range constraints are deliberately excluded — they address octave correction, not pitch-class accuracy, and including them would conflate the two problems.
+
+**`FineCandidates`** — module-level utility function shared by both `AutoTune` and `AutoTuneYIN`. Moved from nested local inside `AutoTune` to module level so both functions can call it.
 
 ### Pitch range constraints
 
@@ -365,6 +386,11 @@ No test framework — REAPER scripts are tested by running them. Manual checks I
 - [ ] Apply pitch changes works with YIN mode (pitch detection runs against audio source track).
 - [ ] YIN mode: Generate assigns non-default pitches for pitched vocal audio.
 - [ ] YIN mode: notes where pitch is ambiguous fall back to the Default pitch without error.
+- [ ] Auto-tune YIN: button is enabled only when Pitch source = Built-in detection; greys out in other modes.
+- [ ] Auto-tune YIN: with corrected reference notes in MIDI item and a time selection, runs without error and updates the four YIN sliders.
+- [ ] Auto-tune YIN: result panel reports notes analysed, score, detected vs fallback counts, and octave mismatch advisory when applicable.
+- [ ] Auto-tune YIN: octave mismatch advisory includes suggested pitch range values derived from the reference note span.
+- [ ] Auto-tune YIN: with no time selection, operates on all notes in the MIDI item.
 - [ ] Save → modify sliders (including YIN params) → Load → all values restored.
 - [ ] Reset Detection / Reset Pitch / Reset MIDI output return their respective sections to factory defaults without affecting others.
 - [ ] Pitch range constraints octave-shift out-of-range notes back into range; clamp when range < 12 semitones.

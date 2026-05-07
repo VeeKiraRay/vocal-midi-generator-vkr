@@ -116,6 +116,8 @@ The script analyses the audio directly using the [YIN algorithm](http://audition
 
 The algorithm samples audio starting at 30% into each note (to avoid the attack transient and land on the steady-state vowel). Notes where no confident pitch is found fall back to Default pitch.
 
+> **Tip:** If YIN produces consistent pitch errors across a section, use **Auto-tune YIN from reference** to automatically search for better settings — see [Auto-tune YIN from reference](#auto-tune-yin-from-reference) below.
+
 #### Pitch range constraints (min / max)
 
 Two optional checkbox+slider pairs clamp or octave-shift pitches into a target range. When a detected pitch is outside the range, the script first tries octave-shifting it back in (±12 semitones, up to 16 attempts), then falls back to clamping. Useful for correcting octave errors from AI stem separation.
@@ -151,6 +153,35 @@ The script runs a coordinate descent search over five detection parameters (**RM
 **What it leaves alone:** RMS window (a resolution choice, not a fit-to-reference parameter), all pitch settings, velocity, and your reference notes themselves.
 
 > **Note:** Auto-tune can take several seconds for longer sections. The UI will be unresponsive during the search — this is expected (see [Known limitations](#known-limitations)).
+
+---
+
+## Auto-tune YIN from reference
+
+Auto-tune YIN automates finding better YIN parameter values when pitch detection produces consistently wrong results across a section.
+
+**How to use it:**
+
+1. Run **Generate notes (append)** in Built-in detection (YIN) mode to produce an initial set of notes.
+2. In REAPER's MIDI editor, manually correct the pitches of a representative handful of notes — keep their positions and lengths unchanged.
+3. Make a time selection covering those corrected notes.
+4. Click **Auto-tune YIN from reference** (the button appears above the YIN sliders, active only when Pitch source = Built-in detection).
+
+The script reads the existing note positions from the MIDI item, sweeps combinations of four YIN parameters (**YIN threshold**, **Min frequency**, **Max frequency**, **YIN window**), and scores each combination against the pitches you corrected. When it finishes, the YIN sliders update to the best-found values and the result panel shows accuracy statistics.
+
+**Scoring is octave-insensitive.** The search measures pitch-class distance — C→C# scores better than C→F, regardless of octave. This separates pitch-class accuracy (what parameter settings affect) from octave correctness (what pitch range constraints fix). Octave mismatches that remain after the search are counted and reported, with a specific suggestion for pitch range constraint values to correct them:
+
+```
+Octave mismatches: 3 — reference spans C3–G4
+  Consider enabling pitch range: min 48 (C3), max 67 (G4)
+```
+
+**What it changes:** YIN threshold, Min frequency, Max frequency, YIN window.
+**What it leaves alone:** all Detection sliders, velocity, pitch range constraints, note positions and lengths.
+
+> **Note:** Auto-tune YIN can take several seconds for longer sections. The UI will be unresponsive during the search — this is expected (see [Known limitations](#known-limitations)).
+
+> **Tip:** Use 10–20 reference notes covering a range of pitches in the section. Notes where pitch was already correct do not need to be touched — the search still converges from partial corrections, and more representative notes produce better results.
 
 ---
 
@@ -279,8 +310,8 @@ Enable **Peak-split ratio**. Start at 40–50% and adjust. The split happens whe
 **Notes are running into each other with no gap between them.**
 Raise **Min offset to next note**. The default of 100 ms is conservative; values up to 200–250 ms work well for slower vocals.
 
-**Auto-tune produces strange results.**
-Auto-tune fits to whatever timing reference notes you give it — if those notes are inaccurate or unrepresentative, the result will be too. Use 10–30 reference notes that cover the dynamic range of the section, and place them carefully.
+**Auto-tune produces strange results, or results aren't noticeably better than defaults.**
+Auto-tune is a heuristic search — it finds the best combination from a set of candidate values, but there is no guarantee that combination will be perfect for every vocal. Even with accurate reference notes, the underlying audio (stem separation quality, room noise, breathy or sibilant vocals) constrains how well any parameter set can perform. Treat the result as a starting point: accept the values, then nudge the sliders manually from there. If the result is consistently poor, check that the reference notes cover the dynamic range of the section and that 10–30 reference notes are used rather than just a few.
 
 ### Pitch
 
@@ -289,6 +320,9 @@ Tighten the **Min frequency** and **Max frequency** range to bracket the actual 
 
 **YIN falls back to Default pitch on most notes.**
 Raise the **YIN threshold** (try 0.2 or 0.25). The threshold is a confidence cutoff — too strict and the algorithm rejects valid detections.
+
+**YIN auto-tune isn't improving results, or the result is still wrong on many notes.**
+YIN auto-tune is a best-estimate search, not a guarantee. Even with perfectly corrected reference notes, pitch detection accuracy is ultimately bounded by the audio itself — stem separation artifacts, noise, or vocal characteristics like heavy vibrato or breathy tone can make some pitches genuinely ambiguous regardless of settings. Treat the result as a better starting point, not a final answer: accept the updated sliders, then use pitch range constraints or **Apply pitch changes** after manual corrections to clean up remaining errors. If the results are consistently poor, also check that the reference notes span a range of pitches in the selection — a reference that is all one note gives the search little gradient to work with.
 
 **Reference MIDI mode reports zero matches.**
 Check that the reference MIDI item actually overlaps the analysis range, and that the **Search tolerance** is wide enough (try 200–500 ms). If your reference is consistently early or late versus the audio, nudge the MIDI item in REAPER to align it.

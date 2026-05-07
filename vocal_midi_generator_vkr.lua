@@ -430,6 +430,19 @@ local TIPS = {
         "'Reference MIDI' or 'Built-in detection'. In Single " ..
         "pitch mode, this would overwrite every note with the same pitch.",
 
+    autotune_yin =
+        "Find YIN settings that best match notes whose pitches you have\n" ..
+        "already corrected manually.\n\n" ..
+        "Prerequisites:\n" ..
+        " - Make a time selection covering the corrected notes.\n" ..
+        " - Ensure notes on the destination MIDI item have the correct pitches\n" ..
+        "   in that range (e.g. from manual editing or Apply pitch changes).\n\n" ..
+        "Sweeps YIN threshold, frequency range, and window length. Scoring is\n" ..
+        "octave-insensitive — pitch-class accuracy is the goal; use pitch range\n" ..
+        "constraints to fix any octave errors afterward.\n\n" ..
+        "Only available when Pitch source is Built-in detection.\n\n" ..
+        "Use 'Save' first to preserve your current values.",
+
     lyrics_auto_detect =
         "Look for 'lyrics.txt' in the current project folder and select it " ..
         "automatically. Nothing happens if the file is not found.",
@@ -1346,6 +1359,15 @@ end
 ----------------------------------------------------------------------
 -- Auto-tune
 ----------------------------------------------------------------------
+local function FineCandidates(value, deltas, lo, hi)
+    local out = {}
+    for _, d in ipairs(deltas) do
+        local v = value + d
+        if v >= lo and v <= hi then out[#out + 1] = v end
+    end
+    return out
+end
+
 local function EvaluateParams(contour_cache, range_info, params)
     local key = ('%.0f|%.2f'):format(params.window_ms, params.lpf_cutoff_hz)
     local contour_info = contour_cache[key]
@@ -1421,15 +1443,6 @@ local function AutoTune(range_info, midi_take)
         SweepParam('min_note_ms',   CANDIDATES_COARSE.min_note_ms)
     end
 
-    local function FineCandidates(value, deltas, lo, hi)
-        local out = {}
-        for _, d in ipairs(deltas) do
-            local v = value + d
-            if v >= lo and v <= hi then out[#out + 1] = v end
-        end
-        return out
-    end
-
     SweepParam('rms_threshold', FineCandidates(best.rms_threshold,
         { -0.015, -0.01, -0.005, 0.005, 0.01, 0.015 }, 0.001, 0.5))
     if best.lpf_cutoff_hz > 0 then
@@ -1482,6 +1495,263 @@ local function ApplyAutoTuneResult(result)
     S.split_ratio   = p.split_ratio
     S.min_offset_ms = p.min_offset_ms
     S.min_note_ms   = p.min_note_ms
+end
+
+local function FormatAutoTuneYINResult(result)
+    local p   = result.params
+    local pct = result.ref_count > 0
+        and (result.pc_hits / result.ref_count * 100) or 0
+
+    local lines = {
+        'YIN auto-tune complete',
+        ('  Reference notes  : %d'):format(result.ref_count),
+        ('  Detected         : %d  (fallback to default: %d)'):format(
+            result.detected, result.fallback),
+        ('  Pitch-class hits : %d  (%.0f%%)'):format(result.pc_hits, pct),
+        '',
+        'Applied values:',
+        ('  YIN threshold  : %.3f'):format(p.yin_threshold),
+        ('  Min frequency  : %.0f Hz'):format(p.yin_min_hz),
+        ('  Max frequency  : %.0f Hz'):format(p.yin_max_hz),
+        ('  YIN window     : %.0f ms'):format(p.yin_window_ms),
+    }
+
+    if result.octave_mismatches > 0 then
+        lines[#lines + 1] = ''
+        lines[#lines + 1] = ('Octave mismatches: %d (correct pitch class, wrong octave).')
+            :format(result.octave_mismatches)
+        lines[#lines + 1] = ('Reference spans %s\xe2\x80\x93%s. Consider enabling pitch range constraints:')
+            :format(PitchName(result.ref_min_pitch), PitchName(result.ref_max_pitch))
+        lines[#lines + 1] = ('  Min pitch: %d (%s),  Max pitch: %d (%s)')
+            :format(result.ref_min_pitch, PitchName(result.ref_min_pitch),
+                    result.ref_max_pitch, PitchName(result.ref_max_pitch))
+    end
+
+    lines[#lines + 1] = ''
+    lines[#lines + 1] = 'These are starting values \xe2\x80\x94 review and fine-tune the sliders as needed.'
+    return table.concat(lines, '\n')
+end
+
+----------------------------------------------------------------------
+-- YIN auto-tune from reference
+----------------------------------------------------------------------
+local function AutoTuneYIN(audio_item, ref_notes)
+    local yin_ctx, err = OpenYINContext(audio_item)
+    if not yin_ctx then return nil, err end
+
+    local sr  = yin_ctx.sr
+    local nch = yin_ctx.nch
+
+    local CANDIDATES_COARSE = {
+        yin_threshold = { 0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.25, 0.30, 0.40 },
+        yin_min_hz    = { 40, 60, 80, 100, 130, 160, 200 },
+        yin_max_hz    = { 400, 600, 800, 1000, 1300, 1600, 2000 },
+        yin_window_ms = { 10, 15, 20, 25, 30, 40, 50, 70 },
+    }
+
+    -- CMND cache keyed by window_ms. Built lazily; each entry is a list of
+    -- per-note { d, n_samps, tau_max } or false when the note is too short.
+    -- Computed up to tau for 40 Hz (the lowest possible candidate min freq) so
+    -- that any min/max freq combination can be evaluated without re-reading audio.
+    local cmnd_cache      = {}
+    local MIN_HZ_ABSOLUTE = 40
+
+    local function GetOrComputeCMND(window_ms)
+        if cmnd_cache[window_ms] then return cmnd_cache[window_ms] end
+        local entries = {}
+        for ni, n in ipairs(ref_notes) do
+            local note_len = n.e - n.s
+            local win_s    = math.min(window_ms / 1000, note_len * 0.8)
+            if win_s < 0.01 then
+                entries[ni] = false
+            else
+                local n_samps = math.max(2, math.floor(win_s * sr))
+                local tau_max = math.min(math.floor(sr / MIN_HZ_ABSOLUTE),
+                                         math.floor(n_samps / 2) - 1)
+                local t_off   = n.s + note_len * 0.3 - yin_ctx.item_pos
+                if t_off < 0 then t_off = 0 end
+
+                local buf = r.new_array(n_samps * nch)
+                buf.clear()
+                r.GetAudioAccessorSamples(yin_ctx.accessor, sr, nch, t_off, n_samps, buf)
+
+                local mono = {}
+                for i = 1, n_samps do
+                    local s = 0
+                    for c = 0, nch - 1 do s = s + buf[(i - 1) * nch + c + 1] end
+                    mono[i] = nch > 1 and s / nch or s
+                end
+
+                local d = {}; d[0] = 0
+                local running_sum = 0
+                for tau = 1, tau_max do
+                    local sq = 0
+                    for j = 1, n_samps - tau do
+                        local diff = mono[j] - mono[j + tau]
+                        sq = sq + diff * diff
+                    end
+                    running_sum = running_sum + sq
+                    d[tau] = running_sum > 0 and sq * tau / running_sum or 1
+                end
+                entries[ni] = { d = d, n_samps = n_samps, tau_max = tau_max }
+            end
+        end
+        cmnd_cache[window_ms] = entries
+        return entries
+    end
+
+    -- Scan a cached CMND with given freq/threshold bounds.
+    -- Returns MIDI pitch or nil on fallback. No audio I/O.
+    local function ScanCMND(e, tau_min, tau_max_eff, threshold, min_hz, max_hz)
+        local d       = e.d
+        local tau_est
+        for tau = tau_min, tau_max_eff - 1 do
+            if d[tau] < threshold then
+                while tau < tau_max_eff and d[tau + 1] < d[tau] do tau = tau + 1 end
+                tau_est = tau
+                break
+            end
+        end
+        if not tau_est then
+            local min_d, min_tau = math.huge, tau_min
+            for tau = tau_min, tau_max_eff do
+                if d[tau] < min_d then min_d = d[tau]; min_tau = tau end
+            end
+            if min_d > 0.5 then return nil end
+            tau_est = min_tau
+        end
+        if tau_est > tau_min and tau_est < tau_max_eff then
+            local s0, s1, s2 = d[tau_est - 1], d[tau_est], d[tau_est + 1]
+            local denom = 2 * s1 - s0 - s2
+            if math.abs(denom) > 1e-10 then
+                tau_est = tau_est + (s0 - s2) / (2 * denom)
+            end
+        end
+        local freq = sr / tau_est
+        if freq < min_hz or freq > max_hz then return nil end
+        return math.floor(69 + 12 * math.log(freq / 440) / math.log(2) + 0.5)
+    end
+
+    -- Score params using cached CMNDs; no audio access after first call per window_ms.
+    local function EvalYIN(params)
+        if params.yin_min_hz >= params.yin_max_hz then return nil end
+        local entries    = GetOrComputeCMND(params.yin_window_ms)
+        local tau_min    = math.max(1, math.floor(sr / params.yin_max_hz))
+        local tau_max_hz = math.floor(sr / params.yin_min_hz)
+        local total      = 0
+        for ni, n in ipairs(ref_notes) do
+            local e = entries[ni]
+            if not e then
+                total = total + 6
+            else
+                local tau_max = math.min(tau_max_hz, e.tau_max, math.floor(e.n_samps / 2) - 1)
+                if tau_max < tau_min then
+                    total = total + 6
+                else
+                    local p = ScanCMND(e, tau_min, tau_max, params.yin_threshold,
+                                       params.yin_min_hz, params.yin_max_hz)
+                    if p then
+                        local diff = math.abs(p - n.pitch) % 12
+                        total = total + math.min(diff, 12 - diff)
+                    else
+                        total = total + 6
+                    end
+                end
+            end
+        end
+        return total
+    end
+
+    local best = {
+        yin_threshold = S.yin_threshold,
+        yin_min_hz    = S.yin_min_freq,
+        yin_max_hz    = S.yin_max_freq,
+        yin_window_ms = S.yin_window_ms,
+    }
+    local best_score = EvalYIN(best) or math.huge
+
+    local function SweepParam(name, candidates)
+        for _, val in ipairs(candidates) do
+            if val ~= best[name] then
+                local trial = {}
+                for k, v in pairs(best) do trial[k] = v end
+                trial[name] = val
+                local sc = EvalYIN(trial)
+                if sc and sc < best_score then
+                    best       = trial
+                    best_score = sc
+                end
+            end
+        end
+    end
+
+    for _ = 1, 2 do
+        SweepParam('yin_threshold', CANDIDATES_COARSE.yin_threshold)
+        SweepParam('yin_min_hz',    CANDIDATES_COARSE.yin_min_hz)
+        SweepParam('yin_max_hz',    CANDIDATES_COARSE.yin_max_hz)
+        SweepParam('yin_window_ms', CANDIDATES_COARSE.yin_window_ms)
+    end
+
+    SweepParam('yin_threshold', FineCandidates(best.yin_threshold,
+        { -0.04, -0.02, -0.01, 0.01, 0.02, 0.04 }, 0.01, 0.5))
+    SweepParam('yin_min_hz', FineCandidates(best.yin_min_hz,
+        { -20, -10, 10, 20 }, 40, 400))
+    SweepParam('yin_max_hz', FineCandidates(best.yin_max_hz,
+        { -100, -50, 50, 100 }, 200, 2000))
+    SweepParam('yin_window_ms', FineCandidates(best.yin_window_ms,
+        { -10, -5, 5, 10 }, 10, 100))
+
+    -- All audio access is done; close accessor before the stats pass.
+    CloseYINContext(yin_ctx)
+
+    -- Final pass at best params from cached CMNDs for detailed result panel stats.
+    local final_entries = cmnd_cache[best.yin_window_ms]
+    local tau_min_final = math.max(1, math.floor(sr / best.yin_max_hz))
+    local tau_max_hz_f  = math.floor(sr / best.yin_min_hz)
+
+    local final_detected    = 0
+    local final_fallback    = 0
+    local pc_hits           = 0
+    local octave_mismatches = 0
+    local ref_min_pitch     = math.huge
+    local ref_max_pitch     = -math.huge
+
+    for ni, n in ipairs(ref_notes) do
+        ref_min_pitch = math.min(ref_min_pitch, n.pitch)
+        ref_max_pitch = math.max(ref_max_pitch, n.pitch)
+        local e = final_entries and final_entries[ni]
+        local p
+        if e then
+            local tau_max = math.min(tau_max_hz_f, e.tau_max, math.floor(e.n_samps / 2) - 1)
+            if tau_max >= tau_min_final then
+                p = ScanCMND(e, tau_min_final, tau_max, best.yin_threshold,
+                             best.yin_min_hz, best.yin_max_hz)
+            end
+        end
+        if p then
+            final_detected = final_detected + 1
+            local diff   = math.abs(p - n.pitch) % 12
+            local pc_err = math.min(diff, 12 - diff)
+            if pc_err == 0 then
+                pc_hits = pc_hits + 1
+                if p ~= n.pitch then octave_mismatches = octave_mismatches + 1 end
+            end
+        else
+            final_fallback = final_fallback + 1
+        end
+    end
+
+    return {
+        params            = best,
+        score             = best_score,
+        ref_count         = #ref_notes,
+        detected          = final_detected,
+        fallback          = final_fallback,
+        pc_hits           = pc_hits,
+        octave_mismatches = octave_mismatches,
+        ref_min_pitch     = ref_min_pitch,
+        ref_max_pitch     = ref_max_pitch,
+    }
 end
 
 ----------------------------------------------------------------------
@@ -1717,6 +1987,76 @@ local function RunAutoTune()
     ApplyAutoTuneResult(result)
     S.status = ('Auto-tune complete in %.1fs.'):format(elapsed)
     S.last_result = FormatAutoTuneResult(result)
+end
+
+local function RunAutoTuneYIN()
+    if not GetTimeSelection() then
+        S.status = 'Error'
+        S.last_result = 'YIN auto-tune requires a time selection covering your corrected reference notes.'
+        return
+    end
+
+    local trks, terr = ResolveApplyPitchTracks()
+    if not trks then S.status = terr; S.last_result = nil; return end
+
+    local target, perr = ResolveApplyPitchTarget(trks.midi)
+    if not target then S.status = 'Error'; S.last_result = perr; return end
+
+    local audio_item
+    for i = 0, r.CountTrackMediaItems(trks.audio) - 1 do
+        local it   = r.GetTrackMediaItem(trks.audio, i)
+        local take = r.GetActiveTake(it)
+        if take and not r.TakeIsMIDI(take) then
+            local pos = r.GetMediaItemInfo_Value(it, 'D_POSITION')
+            local len = r.GetMediaItemInfo_Value(it, 'D_LENGTH')
+            if pos < target.range_end and pos + len > target.range_start then
+                audio_item = it
+                break
+            end
+        end
+    end
+    if not audio_item then
+        S.status = 'Error'
+        S.last_result = 'No audio item on the source track overlaps the time selection.'
+        return
+    end
+
+    local ref_notes = {}
+    local _, n_notes = r.MIDI_CountEvts(target.take)
+    for i = 0, n_notes - 1 do
+        local ok, _, _, sppq, eppq, _, p = r.MIDI_GetNote(target.take, i)
+        if ok and p >= RB3_MIN_PITCH and p <= RB3_MAX_PITCH then
+            local s_t = r.MIDI_GetProjTimeFromPPQPos(target.take, sppq)
+            local e_t = r.MIDI_GetProjTimeFromPPQPos(target.take, eppq)
+            if s_t >= target.range_start - 0.001 and s_t < target.range_end + 0.001 then
+                ref_notes[#ref_notes + 1] = { s = s_t, e = e_t, pitch = p }
+            end
+        end
+    end
+
+    if #ref_notes == 0 then
+        S.status = 'Error'
+        S.last_result =
+            'No notes in the time selection.\n' ..
+            'Place corrected notes on the destination MIDI item first, then run YIN auto-tune.'
+        return
+    end
+
+    S.status = ('YIN auto-tuning against %d reference notes\xe2\x80\xa6 (UI may freeze briefly)')
+        :format(#ref_notes)
+    local t0 = r.time_precise()
+    local result, err = AutoTuneYIN(audio_item, ref_notes)
+    local elapsed = r.time_precise() - t0
+
+    if not result then S.status = 'Error'; S.last_result = err; return end
+
+    S.yin_threshold = result.params.yin_threshold
+    S.yin_min_freq  = result.params.yin_min_hz
+    S.yin_max_freq  = result.params.yin_max_hz
+    S.yin_window_ms = result.params.yin_window_ms
+
+    S.status = ('YIN auto-tune complete in %.1fs.'):format(elapsed)
+    S.last_result = FormatAutoTuneYINResult(result)
 end
 
 ----------------------------------------------------------------------
@@ -2077,6 +2417,7 @@ local function Loop()
 
         local _bp    = 40
         local bw_at  = r.ImGui_CalcTextSize(ctx, 'Auto-tune from reference') + _bp
+        local bw_ayt = r.ImGui_CalcTextSize(ctx, 'Auto-tune YIN from reference') + _bp
         local bw_dry = r.ImGui_CalcTextSize(ctx, 'Dry run') + _bp
         local bw_gen = r.ImGui_CalcTextSize(ctx, 'Generate notes (append)') + _bp
         local bw_app = r.ImGui_CalcTextSize(ctx, 'Apply pitch changes') + _bp
@@ -2162,6 +2503,12 @@ local function Loop()
 
         r.ImGui_Spacing(ctx)
         r.ImGui_Text(ctx, 'Built-in detection settings')
+        if r.ImGui_Button(ctx, 'Auto-tune YIN from reference', bw_ayt, 24) then
+            RunAutoTuneYIN()
+        end
+        Tooltip(TIPS.autotune_yin)
+        r.ImGui_Spacing(ctx)
+
         _, S.yin_threshold = r.ImGui_SliderDouble(ctx, 'YIN threshold',
             S.yin_threshold, 0.01, 0.5, '%.3f')
         SliderTooltip(TIPS.yin_threshold)
