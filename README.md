@@ -232,10 +232,7 @@ All four buttons sit on one row:
 | **Clear lyrics**  | Remove all lyric events from the whole MIDI take (preserves special game events) |
 | **Assign lyrics** | Clear first, then assign one word per note in start-time order                   |
 
-**Assign lyrics** scope:
-
-- With a time selection — only notes within the selection receive lyrics.
-- Without a time selection — all notes in the RB3 vocal range (C1–C5) on the take are used.
+**Assign lyrics** always operates on the whole take regardless of any time selection. Words are read from the start of the file and assigned in order to every note in the RB3 vocal range (C1–C5). Time selection is intentionally ignored — scoping to a selection would assign the first words in the file to whichever notes are in the selection, shifting every subsequent word onto the wrong note.
 
 Special game events (`[tambourine_start]`, `[cowbell_start]`, etc.) are always preserved by both Clear and Assign.
 

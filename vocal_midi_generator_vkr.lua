@@ -2243,10 +2243,8 @@ local function AssignLyricsAction()
         return
     end
 
-    local sel_s, sel_e = GetTimeSelection()
-
-    -- Read all notes: vocal range + phrase markers
-    local all_vocal = {}
+    -- Read all notes: vocal range + phrase markers (whole take, time selection ignored)
+    local scoped = {}
     local phrase_markers = {}
     local _, n_notes = r.MIDI_CountEvts(midi_take)
     for i = 0, n_notes - 1 do
@@ -2255,32 +2253,18 @@ local function AssignLyricsAction()
             local s_t = r.MIDI_GetProjTimeFromPPQPos(midi_take, sppq)
             local e_t = r.MIDI_GetProjTimeFromPPQPos(midi_take, eppq)
             if p >= RB3_MIN_PITCH and p <= RB3_MAX_PITCH then
-                all_vocal[#all_vocal + 1] = { s = s_t, e = e_t }
+                scoped[#scoped + 1] = { s = s_t, e = e_t }
             elseif p == RB3_PHRASE_PITCH then
                 phrase_markers[#phrase_markers + 1] = { s = s_t }
             end
         end
     end
-    table.sort(all_vocal,      function(a, b) return a.s < b.s end)
+    table.sort(scoped,         function(a, b) return a.s < b.s end)
     table.sort(phrase_markers, function(a, b) return a.s < b.s end)
-
-    -- Scope to time selection if present
-    local scoped
-    if sel_s then
-        scoped = {}
-        for _, n in ipairs(all_vocal) do
-            if n.s >= sel_s - 0.001 and n.s < sel_e + 0.001 then
-                scoped[#scoped + 1] = n
-            end
-        end
-    else
-        scoped = all_vocal
-    end
 
     if #scoped == 0 then
         S.status = 'No notes in range.'
-        S.last_result = 'No notes in the RB3 vocal range found' ..
-            (sel_s and (' within time selection (%s — %s).'):format(FormatTime(sel_s), FormatTime(sel_e)) or '.')
+        S.last_result = 'No notes in the RB3 vocal range found on the destination take.'
         return
     end
 
@@ -2307,11 +2291,7 @@ local function AssignLyricsAction()
     -- Build result
     local lines = {}
     lines[#lines + 1] = ('Lyrics assigned: %d syllables added'):format(inserted)
-    if sel_s then
-        lines[#lines + 1] = ('Scope: time selection %s — %s'):format(FormatTime(sel_s), FormatTime(sel_e))
-    else
-        lines[#lines + 1] = 'Scope: whole take'
-    end
+    lines[#lines + 1] = 'Scope: whole take'
     lines[#lines + 1] = ('Cleared %d existing lyric events first'):format(cleared)
 
     -- Count mismatch

@@ -188,12 +188,11 @@ A section below MIDI output for assigning lyric text events to the destination M
 
 **Clear lyrics** — removes all type-5 (lyric) MIDI text events from the entire destination MIDI take, preserving entries in `LYRIC_IGNORE`. Always operates on the whole take regardless of time selection. Wrapped in an undo block.
 
-**Assign lyrics** — clears first (same ignore list), then assigns words from the file to notes in order:
+**Assign lyrics** — clears first (same ignore list), then assigns words from the file to notes in order. Time selection is ignored — always operates on the whole take:
 1. Reads the file, strips `[...]` comment blocks, splits on any whitespace.
 2. Reads all notes from the destination take. Notes in the RB3 vocal range (36–84) become candidates. Notes at `RB3_PHRASE_PITCH` (105) are collected separately for validation.
-3. If a time selection is active, only notes within it receive lyrics. Without a selection, all vocal-range notes on the take are used.
-4. Inserts one type-5 text event at the PPQ start of each candidate note, in start-time order.
-5. Reports to the result panel: syllables added, scope, count-mismatch warning if notes ≠ lyrics, and phrase capitalization check.
+3. Inserts one type-5 text event at the PPQ start of each candidate note, in start-time order.
+4. Reports to the result panel: syllables added, count-mismatch warning if notes ≠ lyrics, and phrase capitalization check.
 
 **Phrase capitalization check** — for each phrase marker note (pitch 105), finds the first scoped note whose start time is at or after the marker's start, and checks that its assigned lyric starts with an uppercase letter. Reports each violation as `mNN  Xm SS.MMMsec  "word"` so the user can navigate directly in REAPER.
 
@@ -261,8 +260,8 @@ All action and auto-tune buttons use `r.ImGui_CalcTextSize(ctx, label) + _bp` fo
 ### 12. Lyrics path is session-only, not persisted
 `S.lyrics_path` is not written to `SerializeSettings`. Reasoning: file paths are machine-specific and change frequently during authoring; persisting a stale path would cause confusing "file not found" errors on next open more often than it would save a click. Auto-detect (`lyrics.txt` in project folder) plus Browse cover the two main workflows without persistence.
 
-### 13. Clear lyrics always operates on the whole take
-`ClearLyricsAction` ignores time selection and always clears all lyric events from the take. Reasoning: lyric events for the ignored special game events (`[tambourine_start]` etc.) can live anywhere on the take; scoping to selection would require knowing their positions relative to the vocal notes. Clearing the whole take and reinserting is the simplest safe approach. The RB3 vocal range filter and `LYRIC_IGNORE` table together protect all non-lyric content.
+### 13. Lyric functions always operate on the whole take
+Both `ClearLyricsAction` and `AssignLyricsAction` ignore time selection and always operate on the full MIDI take. Reasoning: lyrics must be assigned sequentially from the start of the file to match the song order. If Assign respected a time selection it would read from the beginning of the lyrics file but only write to notes in the selection — causing every word after the selection start to land on the wrong note. Clearing the whole take and reassigning from scratch is the only safe approach. The RB3 vocal range filter and `LYRIC_IGNORE` table together protect all non-lyric content.
 
 ### 14. `FormatTime` uses REAPER's own measure formatter
 `r.format_timestr_pos(t, '', 1)` returns the project time in REAPER's measures/beats format (e.g. `"90.1.00"`). The measure number is parsed from the leading digits. This respects arbitrary tempo and time-signature changes in the project without needing to implement measure math manually. Falls back to plain `Xm SS.MMMsec` if parsing fails. Durations (range lengths) are left in plain seconds since they are not positions to navigate to.
@@ -402,8 +401,7 @@ No test framework — REAPER scripts are tested by running them. Manual checks I
 - [ ] Lyrics — Auto-detect finds `lyrics.txt` in the project folder on script open and sets the path silently.
 - [ ] Lyrics — Browse opens in the project folder; selecting a non-.txt file shows an error and does not set the path.
 - [ ] Lyrics — Clear lyrics removes all type-5 events except the LYRIC_IGNORE entries; produces a correct undo entry.
-- [ ] Lyrics — Assign lyrics with no time selection assigns to all vocal-range notes on the take.
-- [ ] Lyrics — Assign lyrics with a time selection assigns only to notes within the selection.
+- [ ] Lyrics — Assign lyrics assigns to all vocal-range notes on the whole take, ignoring any time selection.
 - [ ] Lyrics — Assign lyrics clears existing lyrics first (including partial re-runs don't stack duplicates).
 - [ ] Lyrics — Count mismatch warning appears correctly when notes > lyrics and lyrics > notes.
 - [ ] Lyrics — Phrase capitalization check reports "none found" when no pitch-105 notes exist.
