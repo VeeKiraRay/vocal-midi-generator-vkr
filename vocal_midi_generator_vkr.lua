@@ -1,6 +1,6 @@
 -- @description Vocal MIDI Generator
 -- @author VeeKiraRay
--- @version 1.0
+-- @version 1.1
 -- @about
 --   Analyses a vocal audio track and appends MIDI notes to an existing MIDI
 --   item on a destination track, one note per detected syllable or phrase.
@@ -9,6 +9,13 @@
 --   parameters to manually-placed reference timing notes.
 --
 --   Built with Claude (Anthropic) — https://claude.ai
+--
+--   v1.1
+--     - Added Auto-tune YIN from reference: sweeps YIN parameters
+--       (threshold, frequency range, window) against manually corrected
+--       pitches to find the best-fit settings automatically.
+--     - Fixed Assign lyrics to always operate on the whole MIDI take,
+--       ignoring any time selection (required for correct word-to-note order).
 --
 --   Workflow:
 --     1. Pick the audio source track and the MIDI destination track.
