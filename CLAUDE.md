@@ -134,7 +134,7 @@ The script is organized top-to-bottom in this order. Keep additions in their nat
 
 ## Public-facing concepts (what the UI exposes)
 
-### Detection parameters
+### Note Placement parameters
 
 | Setting | Range | Default | What it does |
 |---|---|---|---|
@@ -335,13 +335,13 @@ These are documented for transparency, not necessarily things to fix. Several ha
 
 ## Common change patterns
 
-### Adding a new detection slider
+### Adding a new Note Placement slider
 
 1. Add field to `DEFAULTS` and `S`.
 2. Add to `ResetDetection`.
 3. Add a TIPS entry.
 4. Add to `SerializeSettings` / `DeserializeSettings` (use a new short key — don't reuse).
-5. Add the slider in the UI loop within the Detection section, with `SliderTooltip(TIPS.foo)`.
+5. Add the slider in the UI loop within the Note Placement tab, with `SliderTooltip(TIPS.foo)`.
 6. Thread it through `RunDetection` / `GateAndSplit` / wherever it applies.
 7. If auto-tune should consider it: add to `CANDIDATES_COARSE`, the `best` table, and a `SweepParam` call in both passes plus a `FineCandidates` call. Confirm the contour cache key still makes sense (only `window_ms` and `lpf_cutoff_hz` should be in the key — those are the only ones that change the contour itself).
 
@@ -391,7 +391,7 @@ No test framework — REAPER scripts are tested by running them. Manual checks I
 - [ ] Auto-tune YIN: octave mismatch advisory includes suggested pitch range values derived from the reference note span.
 - [ ] Auto-tune YIN: with no time selection, operates on all notes in the MIDI item.
 - [ ] Save → modify sliders (including YIN params) → Load → all values restored.
-- [ ] Reset Detection / Reset Pitch / Reset MIDI output return their respective sections to factory defaults without affecting others.
+- [ ] Reset Note Placement / Reset Pitch / Reset MIDI output return their respective sections to factory defaults without affecting others.
 - [ ] Pitch range constraints octave-shift out-of-range notes back into range; clamp when range < 12 semitones.
 - [ ] Reference MIDI mode reports `matched` and `fallback to default` counts correctly.
 - [ ] Smart defaults: on a project with "VOCALS AUDIO" and "PART VOCALS" tracks, those are pre-selected on open.
@@ -409,6 +409,9 @@ No test framework — REAPER scripts are tested by running them. Manual checks I
 - [ ] Lyrics — Phrase capitalization check reports OK when all phrases start with uppercase.
 - [ ] Lyrics — Assign lyrics is greyed out when no file is selected; becomes active after auto-detect or browse.
 - [ ] Timestamps in result panel show measure number and correct mm:ss format for positions ≥ 60 s.
+- [ ] Tab bar renders with 5 tabs; switching tabs does not clear `S.status` / `S.last_result`.
+- [ ] MIDI destination combo appears first (above tab bar); changing it is reflected across all tabs.
+- [ ] Scan pitch slides (Validation tab): shows warning dialog when no time selection; result appears in global panel below tab bar.
 
 ---
 
@@ -424,12 +427,7 @@ Not in scope right now but worth keeping in mind so we don't paint ourselves int
 - **Local-peak-aware splitting.** Replacing the global-peak split rule with per-syllable local peaks for phrases with very uneven dynamics.
 - **Persist track selections across sessions.** Use `GetTrackGUID` to store the selected tracks in project state. Smart defaults (`SetDefaultTracks`) partially cover this for standard project layouts.
 
-- **Tab-based UI layout with a Validation view.** The script UI is getting crowded; a tab bar at the top of the window would separate concerns cleanly. Two tabs initially: **Generate** (current UI, unchanged) and **Validate** (read-only advisory checks). Implementation notes settled from design discussion:
-  - **Fixed tab bar.** Render `ImGui_BeginTabBar` / `ImGui_EndTabBar` outside any child window so it stays visible regardless of window height. Content below goes in `ImGui_BeginChild` using `ImGui_GetContentRegionAvail` for the remaining height.
-  - **Scrolling strategy.** Don't force the Generate tab into a child scroll region — users resize the window today and that's fine. The Validate tab gets its own child scroll region because validation output is naturally a result list. This avoids two competing scroll sources on the Generate side.
-  - **Validation tab is advisory only.** Checks run on demand (a "Run checks" button or auto-run on tab switch); no action modifies the project. Results are a list of pass/warn/fail lines. Community-accepted guidelines go here — things like "phrase notes should start with an uppercase lyric", "no notes shorter than X ms", "gap between consecutive notes", etc. The distinction between blocking issues and advisories should be visually clear (e.g. icon or colour prefix).
-  - **State.** Active tab can be tracked in a local (not `S`) since it doesn't need to survive re-opens. Validation results live in `S.validation_results` (a list of `{level, message}` entries) so they persist while the user switches tabs to act on a finding.
-  - **Open question before building.** Decide which specific checks to ship first and whether the community guideline list lives hardcoded in the script or in an external file the user can extend.
+- **Tab-based UI layout — implemented in v1.3.** Five tabs: **General** (settings save/load), **Note Placement** (detection sliders + MIDI output + Generate), **Pitch** (pitch source + YIN + Apply pitch changes), **Lyrics** (file selection + assign/clear), **Validation** (Scan pitch slides + future checks). Track selectors (MIDI first, then audio) and the status/result panel are global — rendered above and below the tab bar so they're always visible. Future additions to Validation tab: slide detection sensitivity sliders (waiting on user feedback), additional advisory checks (phrase note rules, gap checks, note length warnings).
 
 - **Lyrics syllable hint (opt-in, advisory only).** After Assign lyrics, flag tokens that appear to contain multiple syllables without a hyphen — e.g. `"wonderful"` where the user likely meant `"won-"` + `"der-"` + `"ful"`. Reported as an advisory line in the result panel, never blocking. Key design notes:
   - **Algorithm.** Count vowel-letter groups per token (e.g. `"won"→[o]`, `"der"→[e]`, `"ful"→[u]` = 3 groups → warn). Strip a trailing silent `e` before counting (`"smiles"→"smils"→[i]` = 1 group → no false positive). Tokens that already contain a hyphen are skipped.
