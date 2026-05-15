@@ -1,14 +1,34 @@
 -- @description Vocal MIDI Generator
 -- @author VeeKiraRay
--- @version 1.3
+-- @version 1.5
 -- @about
 --   Analyses a vocal audio track and appends MIDI notes to an existing MIDI
 --   item on a destination track, one note per detected syllable or phrase.
---   Supports three pitch sources: fixed pitch, reference MIDI, and built-in
---   YIN monophonic pitch detection. Includes Auto-tune to fit detection
+--   Supports two pitch correction sources: reference MIDI and built-in YIN
+--   monophonic pitch detection. Includes Auto-tune to fit detection
 --   parameters to manually-placed reference timing notes.
 --
 --   Built with Claude (Anthropic) — https://claude.ai
+--
+--   v1.5
+--     - Generate (replace): new button clears all vocal-range notes in the
+--       analysis range before inserting, producing a clean result. Phrase
+--       markers at other pitches are preserved.
+--     - Generate (append) renamed from "Generate notes (append)".
+--     - Pitch name display now uses Rock Band octave numbering (C1=36).
+--     - Generate and Dry run always assign a fixed pitch (Default pitch
+--       slider, now on the Note Placement tab). Pitch tab is now exclusively
+--       for Apply pitch changes: only Built-in detection and Reference MIDI
+--       remain; Single pitch mode removed; YIN is the new default.
+--       Apply pitch changes is always enabled.
+--     - Validation tab renamed to Pitch slide. YIN threshold and frequency
+--       sliders added alongside Slide Scan controls so the full pitch slide
+--       workflow is contained in one tab.
+--
+--   v1.4
+--     - Slide Scan sliders added to the Validation tab: all five scan
+--       parameters (min note length, min segment, edge skip, sample step,
+--       sample window) are now adjustable and persisted with project settings.
 --
 --   v1.3
 --     - Tab-based UI: reorganised into 5 tabs (General, Note Placement,
@@ -98,7 +118,7 @@ local DEFAULTS = {
     lpf_cutoff_hz     = 0,
     split_ratio       = 0,
 
-    pitch_mode        = MODE_SINGLE,
+    pitch_mode        = MODE_YIN,
     pitch             = 60,
     ref_search_ms     = 500,
     min_pitch_enabled = false,
@@ -112,6 +132,12 @@ local DEFAULTS = {
     yin_window_ms     = 30,
 
     velocity          = 100,
+
+    slide_min_note_ms = 200,
+    slide_min_seg_ms  = 50,
+    slide_skip_ms     = 20,
+    slide_step_ms     = 20,
+    slide_win_ms      = 20,
 }
 
 local S = {
@@ -141,6 +167,12 @@ local S = {
     yin_window_ms     = DEFAULTS.yin_window_ms,
 
     velocity          = DEFAULTS.velocity,
+
+    slide_min_note_ms = DEFAULTS.slide_min_note_ms,
+    slide_min_seg_ms  = DEFAULTS.slide_min_seg_ms,
+    slide_skip_ms     = DEFAULTS.slide_skip_ms,
+    slide_step_ms     = DEFAULTS.slide_step_ms,
+    slide_win_ms      = DEFAULTS.slide_win_ms,
 
     status            = 'Ready.',
     last_result       = nil,
@@ -173,6 +205,21 @@ local function ResetMIDIOutput()
     S.velocity = DEFAULTS.velocity
 end
 
+local function ResetSlides()
+    S.slide_min_note_ms = DEFAULTS.slide_min_note_ms
+    S.slide_min_seg_ms  = DEFAULTS.slide_min_seg_ms
+    S.slide_skip_ms     = DEFAULTS.slide_skip_ms
+    S.slide_step_ms     = DEFAULTS.slide_step_ms
+    S.slide_win_ms      = DEFAULTS.slide_win_ms
+end
+
+local function ResetYIN()
+    S.yin_threshold = DEFAULTS.yin_threshold
+    S.yin_min_freq  = DEFAULTS.yin_min_freq
+    S.yin_max_freq  = DEFAULTS.yin_max_freq
+    S.yin_window_ms = DEFAULTS.yin_window_ms
+end
+
 ----------------------------------------------------------------------
 -- Settings save/load (project state)
 ----------------------------------------------------------------------
@@ -186,7 +233,8 @@ local function SerializeSettings()
     return ('rms=%.6f;lpf=%.2f;split=%.2f;offset=%.2f;minnote=%.2f;window=%.2f;' ..
             'pmode=%d;pitch=%d;reftol=%.0f;' ..
             'minpe=%d;minp=%d;maxpe=%d;maxp=%d;vel=%d;' ..
-            'yt=%.3f;ymn=%.0f;ymx=%.0f;yw=%.0f')
+            'yt=%.3f;ymn=%.0f;ymx=%.0f;yw=%.0f;' ..
+            'sl_mn=%d;sl_ms=%d;sl_sk=%d;sl_st=%d;sl_wn=%d')
         :format(S.rms_threshold, S.lpf_cutoff_hz, S.split_ratio,
                 S.min_offset_ms, S.min_note_ms, S.window_ms,
                 S.pitch_mode, math.floor(S.pitch + 0.5), S.ref_search_ms,
@@ -195,7 +243,9 @@ local function SerializeSettings()
                 bool_to_num(S.max_pitch_enabled),
                 math.floor(S.max_pitch + 0.5),
                 math.floor(S.velocity + 0.5),
-                S.yin_threshold, S.yin_min_freq, S.yin_max_freq, S.yin_window_ms)
+                S.yin_threshold, S.yin_min_freq, S.yin_max_freq, S.yin_window_ms,
+                S.slide_min_note_ms, S.slide_min_seg_ms, S.slide_skip_ms,
+                S.slide_step_ms, S.slide_win_ms)
 end
 
 local function DeserializeSettings(str)
@@ -210,6 +260,7 @@ local function DeserializeSettings(str)
     if tmp.minnote then S.min_note_ms       = tmp.minnote end
     if tmp.window  then S.window_ms         = tmp.window  end
     if tmp.pmode   then S.pitch_mode        = tmp.pmode   end
+    if S.pitch_mode == MODE_SINGLE then S.pitch_mode = DEFAULTS.pitch_mode end
     if tmp.pitch   then S.pitch             = math.floor(tmp.pitch + 0.5) end
     if tmp.reftol  then S.ref_search_ms     = tmp.reftol  end
     if tmp.minpe   then S.min_pitch_enabled = num_to_bool(tmp.minpe) end
@@ -221,6 +272,11 @@ local function DeserializeSettings(str)
     if tmp.ymn     then S.yin_min_freq      = math.floor(tmp.ymn + 0.5) end
     if tmp.ymx     then S.yin_max_freq      = math.floor(tmp.ymx + 0.5) end
     if tmp.yw      then S.yin_window_ms     = tmp.yw                     end
+    if tmp.sl_mn   then S.slide_min_note_ms = math.floor(tmp.sl_mn + 0.5) end
+    if tmp.sl_ms   then S.slide_min_seg_ms  = math.floor(tmp.sl_ms + 0.5) end
+    if tmp.sl_sk   then S.slide_skip_ms     = math.floor(tmp.sl_sk + 0.5) end
+    if tmp.sl_st   then S.slide_step_ms     = math.floor(tmp.sl_st + 0.5) end
+    if tmp.sl_wn   then S.slide_win_ms      = math.floor(tmp.sl_wn + 0.5) end
 end
 
 local function SaveSettings()
@@ -354,8 +410,10 @@ local TIPS = {
         "30 ms is a good default for most vocals.",
 
     pitch =
-        "Pitch used for every note in Single mode, and as the fallback in " ..
-        "Reference mode when no reference note is within tolerance.",
+        "Pitch assigned to all notes by Generate and Dry run.\n\n" ..
+        "Also used as the fallback when Reference MIDI or Built-in detection " ..
+        "cannot find a pitch for a note.\n\n" ..
+        "Set this on the Note Placement tab.",
 
     ref_track =
         "MIDI track containing reference notes whose pitches will be copied " ..
@@ -417,7 +475,13 @@ local TIPS = {
     generate =
         "Run detection and append the resulting notes to the existing MIDI " ..
         "item on the destination track. First clears existing notes at every " ..
-        "pitch the new run will produce (plus the Default pitch).",
+        "pitch the new run will produce (plus the Default pitch), so re-running " ..
+        "over the same range does not stack duplicates.",
+
+    generate_replace =
+        "Run detection and replace all existing notes in the analysis range " ..
+        "(vocal pitch range only — phrase markers at other pitches are preserved). " ..
+        "Produces a clean result with no leftover notes from previous runs.",
 
     autotune =
         "Find detection settings that best match reference notes you've " ..
@@ -441,9 +505,7 @@ local TIPS = {
         "MIDI item.\n\n" ..
         "Each existing note gets a new pitch via the configured Pitch source. " ..
         "Pitch range constraints are applied. Velocity, position, and length " ..
-        "are preserved.\n\n" ..
-        "Disabled when Pitch source is 'Single pitch' — that mode would just " ..
-        "set every note to the Default pitch, which is rarely what you want.",
+        "are preserved.",
 
     apply_pitch_disabled =
         "Apply pitch changes is only available when Pitch source is set to " ..
@@ -473,16 +535,39 @@ local TIPS = {
         "  Scoop       — dips then rises (e.g. start mid, drop, go high)\n" ..
         "  Bend        — rises then falls\n" ..
         "  Complex slide — three or more direction changes\n\n" ..
-        "Stable notes are not reported. Notes shorter than 80ms are skipped.\n" ..
-        "Requires at least two detected pitches each lasting 20ms or more\n" ..
+        "Stable notes are not reported. Notes below Min note length are skipped.\n" ..
+        "Requires at least two pitch segments each meeting Min segment duration\n" ..
         "inside the note to count as a slide.\n" ..
         "Octave detection errors (C3 vs C5) are ignored — only pitch-class\n" ..
         "changes trigger a slide report.\n\n" ..
-        "Uses the current YIN threshold and frequency range settings.\n\n" ..
+        "Uses the YIN threshold and frequency settings in the section above.\n\n" ..
         "Scope:\n" ..
         " - With time selection: scans notes within the selection.\n" ..
         " - Without time selection: scans all notes on the MIDI item.\n\n" ..
         "Read-only — does not modify the project.",
+
+    reset_slides =
+        "Reset all Slide Scan sliders to factory defaults.",
+    reset_yin =
+        "Reset YIN detection settings to factory defaults.",
+    slide_min_note_ms =
+        "Notes shorter than this duration are skipped entirely.\n" ..
+        "Increase to ignore short notes; decrease to scan more aggressively.\n\n",
+    slide_min_seg_ms =
+        "A detected pitch run shorter than this is discarded.\n" ..
+        "Increase to suppress flickery false positives;\n" ..
+        "decrease to catch very short slides.\n\n",
+    slide_skip_ms =
+        "Skip the start and end of each note before sampling.\n" ..
+        "Hides consonant artifacts at note boundaries.\n" ..
+        "Set to 0 for clean audio with no edge artifacts.\n\n",
+    slide_step_ms =
+        "How often pitch is sampled along the note.\n" ..
+        "Smaller = more resolution and better coverage, but slower scan.\n\n",
+    slide_win_ms =
+        "YIN analysis window per sample point.\n" ..
+        "Longer = more stable detection;\n" ..
+        "shorter = catches faster pitch changes.\n\n",
 
     lyrics_auto_detect =
         "Look for 'lyrics.txt' in the current project folder and select it " ..
@@ -519,7 +604,7 @@ local NOTE_NAMES = { 'C','C#','D','D#','E','F','F#','G','G#','A','A#','B' }
 local function PitchName(p)
     p = math.floor(p + 0.5)
     if p < 0 then p = 0 elseif p > 127 then p = 127 end
-    local octave = math.floor(p / 12) - 1
+    local octave = math.floor(p / 12) - 2  -- Rock Band octave convention (C1=36, not C2)
     return ('%s%d'):format(NOTE_NAMES[(p % 12) + 1], octave)
 end
 
@@ -915,6 +1000,23 @@ local function ClearNotesAtPitchesInRange(midi_take, pitch_set, range_start, ran
     return removed
 end
 
+local function ClearAllNotesInRange(midi_take, range_start, range_end)
+    local _, n_notes = r.MIDI_CountEvts(midi_take)
+    local removed = 0
+    for i = n_notes - 1, 0, -1 do
+        local ok, _, _, sppq, eppq, _, p = r.MIDI_GetNote(midi_take, i)
+        if ok and p >= RB3_MIN_PITCH and p <= RB3_MAX_PITCH then
+            local s_t = r.MIDI_GetProjTimeFromPPQPos(midi_take, sppq)
+            local e_t = r.MIDI_GetProjTimeFromPPQPos(midi_take, eppq)
+            if s_t < range_end and e_t > range_start then
+                r.MIDI_DeleteNote(midi_take, i)
+                removed = removed + 1
+            end
+        end
+    end
+    return removed
+end
+
 ----------------------------------------------------------------------
 -- RMS contour
 ----------------------------------------------------------------------
@@ -1295,8 +1397,8 @@ end
 ----------------------------------------------------------------------
 -- Assign pitches based on the configured Pitch source
 ----------------------------------------------------------------------
-local function AssignPitches(notes, ref_track, audio_item)
-    local mode = S.pitch_mode
+local function AssignPitches(notes, ref_track, audio_item, force_mode)
+    local mode = force_mode ~= nil and force_mode or S.pitch_mode
     local default = S.pitch
     local min_p = S.min_pitch_enabled and S.min_pitch or nil
     local max_p = S.max_pitch_enabled and S.max_pitch or nil
@@ -1980,7 +2082,7 @@ local function Preview()
     local res, err = RunDetection(range_info)
     if not res then S.status = 'Error'; S.last_result = err; return end
 
-    local with_pitch, ps_or_err = AssignPitches(res.notes, trks.ref, range_info.item)
+    local with_pitch, ps_or_err = AssignPitches(res.notes, trks.ref, range_info.item, MODE_SINGLE)
     if not with_pitch then
         S.status = 'Error'; S.last_result = ps_or_err; return
     end
@@ -1989,7 +2091,7 @@ local function Preview()
     S.last_result = FormatResult(res, 'Preview', nil, ps_or_err)
 end
 
-local function Generate()
+local function Generate(replace)
     local trks, terr = ResolveTracks()
     if not trks then S.status = terr; S.last_result = nil; return end
 
@@ -2043,23 +2145,30 @@ local function Generate()
     local res, err = RunDetection(range_info)
     if not res then S.status = 'Error'; S.last_result = err; return end
 
-    local with_pitch, ps_or_err = AssignPitches(res.notes, trks.ref, range_info.item)
+    local with_pitch, ps_or_err = AssignPitches(res.notes, trks.ref, range_info.item, MODE_SINGLE)
     if not with_pitch then S.status = 'Error'; S.last_result = ps_or_err; return end
 
-    local pitch_set = { [S.pitch] = true }
-    for _, n in ipairs(with_pitch) do pitch_set[n.pitch] = true end
-
+    local cleared
     r.PreventUIRefresh(1)
     r.Undo_BeginBlock()
-    local cleared = ClearNotesAtPitchesInRange(midi_take, pitch_set,
-        range_info.range_start, range_info.range_end)
+    if replace then
+        cleared = ClearAllNotesInRange(midi_take,
+            range_info.range_start, range_info.range_end)
+    else
+        local pitch_set = { [S.pitch] = true }
+        for _, n in ipairs(with_pitch) do pitch_set[n.pitch] = true end
+        cleared = ClearNotesAtPitchesInRange(midi_take, pitch_set,
+            range_info.range_start, range_info.range_end)
+    end
     InsertNotes(midi_take, with_pitch, S.velocity)
+    local verb = replace and 'replaced' or 'appended'
     r.Undo_EndBlock(
-        ('Karaoke MIDI: cleared %d, appended %d'):format(cleared, #with_pitch), -1)
+        ('Karaoke MIDI: cleared %d, %s %d'):format(cleared, verb, #with_pitch), -1)
     r.PreventUIRefresh(-1)
 
+    local action = replace and 'Replaced' or 'Appended'
     S.status = 'Done.'
-    S.last_result = FormatResult(res, 'Appended', cleared, ps_or_err)
+    S.last_result = FormatResult(res, action, cleared, ps_or_err)
     if clamp_warning then
         S.last_result = S.last_result .. '\n\n' .. clamp_warning
     end
@@ -2313,11 +2422,6 @@ end
 -- Pitch slide scan
 ----------------------------------------------------------------------
 -- Constants for the scan (not user-configurable yet — wait for feedback)
-local SLIDE_MIN_NOTE_S = 0.080  -- skip notes shorter than 80ms
-local SLIDE_STEP_S     = 0.010  -- sample pitch every 10ms
-local SLIDE_WIN_S      = 0.020  -- YIN analysis window per sample (20ms)
-local SLIDE_SKIP_S     = 0.020  -- skip first/last 20ms to avoid consonants
-local SLIDE_MIN_SEG_S  = 0.020  -- minimum pitch-segment duration to count
 
 -- Classify the shape of a pitch trajectory from a list of pitch segments.
 -- segs: list of {pc, median_midi, ...}, 2 or more entries, adjacent entries
@@ -2452,22 +2556,25 @@ local function ScanPitchSlidesAction()
 
     for _, note in ipairs(notes) do
         local dur = note.e - note.s
-        if dur < SLIDE_MIN_NOTE_S then
+        if dur < S.slide_min_note_ms * 0.001 then
             n_too_short = n_too_short + 1
         else
             n_scanned = n_scanned + 1
+            local slide_win_s  = S.slide_win_ms  * 0.001
+            local slide_step_s = S.slide_step_ms * 0.001
+            local slide_skip_s = S.slide_skip_ms * 0.001
 
-            -- Collect YIN samples every SLIDE_STEP_S, skipping note edges
-            local scan_s = note.s + SLIDE_SKIP_S
-            local scan_e = note.e - SLIDE_SKIP_S
+            -- Collect YIN samples every slide_step_s, skipping note edges
+            local scan_s = note.s + slide_skip_s
+            local scan_e = note.e - slide_skip_s
             local raw = {}
             local t = scan_s
-            while t + SLIDE_WIN_S <= scan_e do
-                local p = SampleYINAt(yctx, t, SLIDE_WIN_S)
+            while t + slide_win_s <= scan_e do
+                local p = SampleYINAt(yctx, t, slide_win_s)
                 raw[#raw + 1] = {
                     t = t, midi = p, pc = p and (p % 12) or nil,
                 }
-                t = t + SLIDE_STEP_S
+                t = t + slide_step_s
             end
 
             -- Group consecutive valid samples by pitch class
@@ -2478,12 +2585,12 @@ local function ScanPitchSlidesAction()
                     if not cur or cur.pc ~= sp.pc then
                         cur = {
                             pc = sp.pc, midi_list = { sp.midi },
-                            t_start = sp.t, t_end = sp.t + SLIDE_WIN_S,
+                            t_start = sp.t, t_end = sp.t + slide_win_s,
                         }
                         segs[#segs + 1] = cur
                     else
                         cur.midi_list[#cur.midi_list + 1] = sp.midi
-                        cur.t_end = sp.t + SLIDE_WIN_S
+                        cur.t_end = sp.t + slide_win_s
                     end
                 else
                     cur = nil  -- gap resets the current segment
@@ -2497,10 +2604,10 @@ local function ScanPitchSlidesAction()
                 seg.duration = seg.t_end - seg.t_start
             end
 
-            -- Filter: discard segments shorter than SLIDE_MIN_SEG_S
+            -- Filter: discard segments shorter than slide_min_seg_s
             local filtered = {}
             for _, seg in ipairs(segs) do
-                if seg.duration >= SLIDE_MIN_SEG_S then
+                if seg.duration >= S.slide_min_seg_ms * 0.001 then
                     filtered[#filtered + 1] = seg
                 end
             end
@@ -2587,8 +2694,8 @@ local function ScanPitchSlidesAction()
         ('Range: %s - %s%s'):format(
             FormatTime(range_start), FormatTime(range_end),
             has_sel and ' [time selection]' or ' [whole MIDI item]'),
-        ('%d notes  |  %d scanned  |  %d too short (<80ms)  |  %d stable')
-            :format(#notes, n_scanned, n_too_short, n_stable),
+        ('%d notes  |  %d scanned  |  %d too short (<%dms)  |  %d stable')
+            :format(#notes, n_scanned, n_too_short, S.slide_min_note_ms, n_stable),
     }
 
     if #slide_results == 0 then
@@ -2837,7 +2944,8 @@ local function Loop()
         local bw_at  = r.ImGui_CalcTextSize(ctx, 'Auto-tune from reference') + _bp
         local bw_ayt = r.ImGui_CalcTextSize(ctx, 'Auto-tune YIN from reference') + _bp
         local bw_dry = r.ImGui_CalcTextSize(ctx, 'Dry run') + _bp
-        local bw_gen = r.ImGui_CalcTextSize(ctx, 'Generate notes (append)') + _bp
+        local bw_gen = r.ImGui_CalcTextSize(ctx, 'Generate (append)') + _bp
+        local bw_grp = r.ImGui_CalcTextSize(ctx, 'Generate (replace)') + _bp
         local bw_app = r.ImGui_CalcTextSize(ctx, 'Apply pitch changes') + _bp
         local bw_und = r.ImGui_CalcTextSize(ctx, 'Undo') + _bp
         local bw_sld = r.ImGui_CalcTextSize(ctx, 'Scan pitch slides') + _bp
@@ -2919,6 +3027,10 @@ local function Loop()
                 _, S.velocity = r.ImGui_SliderInt(ctx, 'Velocity', S.velocity, 1, 127)
                 SliderTooltip(TIPS.velocity)
 
+                local pfmt = ('%%d  (%s)'):format(PitchName(S.pitch))
+                _, S.pitch = r.ImGui_SliderInt(ctx, 'Default pitch', S.pitch, RB3_MIN_PITCH, RB3_MAX_PITCH, pfmt)
+                SliderTooltip(TIPS.pitch)
+
                 r.ImGui_Separator(ctx)
                 if r.ImGui_Button(ctx, 'Dry run', bw_dry, 24) then
                     Preview()
@@ -2926,10 +3038,16 @@ local function Loop()
                 Tooltip(TIPS.preview)
 
                 r.ImGui_SameLine(ctx)
-                if r.ImGui_Button(ctx, 'Generate notes (append)', bw_gen, 24) then
+                if r.ImGui_Button(ctx, 'Generate (append)', bw_gen, 24) then
                     Generate()
                 end
                 Tooltip(TIPS.generate)
+
+                r.ImGui_SameLine(ctx)
+                if r.ImGui_Button(ctx, 'Generate (replace)', bw_grp, 24) then
+                    Generate(true)
+                end
+                Tooltip(TIPS.generate_replace)
 
                 local undo_str = r.Undo_CanUndo2(0) or ''
                 local can_undo = undo_str ~= ''
@@ -2952,38 +3070,15 @@ local function Loop()
                 SectionHeader('Pitch', 'Reset##pitch', ResetPitch, TIPS.reset_pitch)
 
                 r.ImGui_Text(ctx, 'Pitch source:')
-                if r.ImGui_RadioButton(ctx, 'Single pitch', S.pitch_mode == MODE_SINGLE) then
-                    S.pitch_mode = MODE_SINGLE
+                if r.ImGui_RadioButton(ctx, 'Built-in detection', S.pitch_mode == MODE_YIN) then
+                    S.pitch_mode = MODE_YIN
                 end
-                Tooltip(TIPS.pitch_mode_single)
+                Tooltip(TIPS.pitch_mode_yin)
                 r.ImGui_SameLine(ctx)
                 if r.ImGui_RadioButton(ctx, 'Reference MIDI', S.pitch_mode == MODE_REFERENCE) then
                     S.pitch_mode = MODE_REFERENCE
                 end
                 Tooltip(TIPS.pitch_mode_reference)
-                r.ImGui_SameLine(ctx)
-                if r.ImGui_RadioButton(ctx, 'Built-in detection', S.pitch_mode == MODE_YIN) then
-                    S.pitch_mode = MODE_YIN
-                end
-                Tooltip(TIPS.pitch_mode_yin)
-
-                local _
-                local pfmt = ('%%d  (%s)'):format(PitchName(S.pitch))
-                _, S.pitch = r.ImGui_SliderInt(ctx, 'Default pitch', S.pitch, RB3_MIN_PITCH, RB3_MAX_PITCH, pfmt)
-                SliderTooltip(TIPS.pitch)
-
-                local ref_disabled = (S.pitch_mode ~= MODE_REFERENCE)
-                if ref_disabled then r.ImGui_BeginDisabled(ctx) end
-
-                r.ImGui_Text(ctx, 'Reference MIDI track')
-                S.ref_idx = TrackCombo('##refmidi', S.ref_idx, tracks)
-                Tooltip(TIPS.ref_track)
-
-                _, S.ref_search_ms = r.ImGui_SliderDouble(ctx, 'Search tolerance (ms)',
-                    S.ref_search_ms, 50, 2000, '%.0f')
-                SliderTooltip(TIPS.ref_search)
-
-                if ref_disabled then r.ImGui_EndDisabled(ctx) end
 
                 local yin_disabled = (S.pitch_mode ~= MODE_YIN)
                 if yin_disabled then r.ImGui_BeginDisabled(ctx) end
@@ -2996,6 +3091,7 @@ local function Loop()
                 Tooltip(TIPS.autotune_yin)
                 r.ImGui_Spacing(ctx)
 
+                local _
                 _, S.yin_threshold = r.ImGui_SliderDouble(ctx, 'YIN threshold',
                     S.yin_threshold, 0.01, 0.5, '%.3f')
                 SliderTooltip(TIPS.yin_threshold)
@@ -3011,6 +3107,20 @@ local function Loop()
                 SliderTooltip(TIPS.yin_window_ms)
 
                 if yin_disabled then r.ImGui_EndDisabled(ctx) end
+
+                local ref_disabled = (S.pitch_mode ~= MODE_REFERENCE)
+                if ref_disabled then r.ImGui_BeginDisabled(ctx) end
+
+                r.ImGui_Spacing(ctx)
+                r.ImGui_Text(ctx, 'Reference MIDI track')
+                S.ref_idx = TrackCombo('##refmidi', S.ref_idx, tracks)
+                Tooltip(TIPS.ref_track)
+
+                _, S.ref_search_ms = r.ImGui_SliderDouble(ctx, 'Search tolerance (ms)',
+                    S.ref_search_ms, 50, 2000, '%.0f')
+                SliderTooltip(TIPS.ref_search)
+
+                if ref_disabled then r.ImGui_EndDisabled(ctx) end
 
                 r.ImGui_Spacing(ctx)
                 r.ImGui_Text(ctx, 'Pitch range constraints')
@@ -3039,17 +3149,10 @@ local function Loop()
                 end
 
                 r.ImGui_Separator(ctx)
-                local apply_disabled = (S.pitch_mode == MODE_SINGLE)
-                if apply_disabled then r.ImGui_BeginDisabled(ctx) end
                 if r.ImGui_Button(ctx, 'Apply pitch changes', bw_app, 24) then
                     ApplyPitchChangesAction()
                 end
-                if apply_disabled then
-                    r.ImGui_EndDisabled(ctx)
-                    Tooltip(TIPS.apply_pitch_disabled)
-                else
-                    Tooltip(TIPS.apply_pitch)
-                end
+                Tooltip(TIPS.apply_pitch)
 
                 local undo_str = r.Undo_CanUndo2(0) or ''
                 local can_undo = undo_str ~= ''
@@ -3144,10 +3247,48 @@ local function Loop()
             end
 
             ------------------------------------------------------------
-            -- Tab: Validation
+            -- Tab: Pitch slide
             ------------------------------------------------------------
-            if r.ImGui_BeginTabItem(ctx, 'Validation') then
+            if r.ImGui_BeginTabItem(ctx, 'Pitch slide') then
                 r.ImGui_Spacing(ctx)
+                SectionHeader('Slide Scan', 'Reset##slides', ResetSlides, TIPS.reset_slides)
+                _, S.slide_min_note_ms = r.ImGui_SliderInt(ctx, 'Min note length (ms)##sld', S.slide_min_note_ms, 20, 500)
+                S.slide_min_note_ms = math.max(20,  math.floor(S.slide_min_note_ms / 10 + 0.5) * 10)
+                SliderTooltip(TIPS.slide_min_note_ms)
+                _, S.slide_min_seg_ms  = r.ImGui_SliderInt(ctx, 'Min segment (ms)##sld',     S.slide_min_seg_ms,   5, 100)
+                S.slide_min_seg_ms  = math.max(5,   math.floor(S.slide_min_seg_ms  /  5 + 0.5) *  5)
+                SliderTooltip(TIPS.slide_min_seg_ms)
+                _, S.slide_skip_ms     = r.ImGui_SliderInt(ctx, 'Edge skip (ms)##sld',       S.slide_skip_ms,      0,  50)
+                S.slide_skip_ms     = math.max(0,   math.floor(S.slide_skip_ms     /  5 + 0.5) *  5)
+                SliderTooltip(TIPS.slide_skip_ms)
+                _, S.slide_step_ms     = r.ImGui_SliderInt(ctx, 'Sample step (ms)##sld',     S.slide_step_ms,      5,  50)
+                S.slide_step_ms     = math.max(5,   math.floor(S.slide_step_ms     /  5 + 0.5) *  5)
+                SliderTooltip(TIPS.slide_step_ms)
+                _, S.slide_win_ms      = r.ImGui_SliderInt(ctx, 'Sample window (ms)##sld',   S.slide_win_ms,      10,  50)
+                S.slide_win_ms      = math.max(10,  math.floor(S.slide_win_ms      /  5 + 0.5) *  5)
+                SliderTooltip(TIPS.slide_win_ms)
+                local min_slidable_ms = S.slide_skip_ms * 2 + S.slide_min_seg_ms * 2
+                if min_slidable_ms > S.slide_min_note_ms then
+                    r.ImGui_Spacing(ctx)
+                    r.ImGui_TextColored(ctx, 0xFFAA00FF,
+                        ('! Min segment \xc3\x972 + Edge skip \xc3\x972 = %dms exceeds Min note length (%dms).')
+                            :format(min_slidable_ms, S.slide_min_note_ms))
+                    r.ImGui_TextColored(ctx, 0xFFAA00FF,
+                        '  No slides can be detected with these settings.')
+                end
+                r.ImGui_Separator(ctx)
+                SectionHeader('YIN Detection', 'Reset##yin', ResetYIN, TIPS.reset_yin)
+                _, S.yin_threshold = r.ImGui_SliderDouble(ctx, 'YIN threshold',
+                    S.yin_threshold, 0.01, 0.5, '%.3f')
+                SliderTooltip(TIPS.yin_threshold)
+                _, S.yin_min_freq = r.ImGui_SliderInt(ctx, 'Min frequency (Hz)',
+                    S.yin_min_freq, 40, 400)
+                SliderTooltip(TIPS.yin_min_freq)
+                _, S.yin_max_freq = r.ImGui_SliderInt(ctx, 'Max frequency (Hz)',
+                    S.yin_max_freq, 200, 2000)
+                SliderTooltip(TIPS.yin_max_freq)
+                if S.yin_min_freq >= S.yin_max_freq then S.yin_max_freq = S.yin_min_freq + 1 end
+                r.ImGui_Separator(ctx)
                 if r.ImGui_Button(ctx, 'Scan pitch slides', bw_sld, 24) then
                     ScanPitchSlidesAction()
                 end

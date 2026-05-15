@@ -35,7 +35,7 @@ Two specialized actions exist outside that main loop:
 
 - **Auto-tune from reference.** User manually places a few notes at the Default pitch as a "ground truth" timing reference, makes a time selection over them, and hits Auto-tune. The script searches for detection parameters (coordinate descent) that best reproduce those reference notes, then applies them to the sliders. Doesn't change pitch settings or RMS window.
 - **Auto-tune YIN from reference.** User generates notes in YIN mode, manually corrects pitches on a handful of notes in the MIDI editor, makes a time selection over them, and clicks Auto-tune YIN. The script sweeps YIN parameter combinations (threshold, frequency range, window) scored against the corrected pitches, and applies the best-found values to the YIN sliders. Enabled only in YIN mode. Uses a CMND cache so most sweeps are pure in-memory scans with no audio I/O.
-- **Apply pitch changes.** Skips detection entirely. Reads the existing notes on the destination MIDI item and reassigns their pitches via the configured Pitch source, preserving position and length. Used after manual timing tweaks. Disabled in Single pitch mode.
+- **Apply pitch changes.** Skips detection entirely. Reads the existing notes on the destination MIDI item and reassigns their pitches via the configured Pitch source (Built-in detection or Reference MIDI), preserving position and length. Used after manual timing tweaks. Always enabled.
 
 ---
 
@@ -144,12 +144,12 @@ The script is organized top-to-bottom in this order. Keep additions in their nat
 | **Min offset to next note** | 0 – 500 ms | 100 ms | Forces a minimum gap before the next note. End times get capped. |
 | **Min note length** | 10 – 500 ms | 60 ms | Discards sub-threshold notes. |
 | **RMS window** | 5 – 100 ms | 25 ms | Analysis resolution. Trade-off between precision and speed. **Not modified by Auto-tune.** |
+| **Default pitch** | RB3_MIN – RB3_MAX | 60 (C4) | Pitch assigned to every note by Generate and Dry run. Also used as the fallback for Reference MIDI and Built-in detection when no pitch can be found. |
 
-### Pitch sources (radio button)
+### Pitch sources (radio button on Pitch tab — used only by Apply pitch changes)
 
-- **Single pitch.** Every note gets `S.pitch` (the Default pitch slider).
+- **Built-in detection (YIN).** Runs the YIN monophonic pitch detection algorithm on the audio source directly — no external MIDI reference needed. Samples a window from ~30% into each note (to hit steady-state vowel, avoiding the attack transient). Falls back to Default pitch when the algorithm cannot find a confident pitch estimate. This is the default.
 - **Reference MIDI.** For each note, find the nearest MIDI note on a chosen reference track within the configured Search tolerance (50–2000 ms). Falls back to Default pitch when nothing is in range. Reads from *all* MIDI items on the reference track that overlap the analysis range.
-- **Built-in detection (YIN).** Runs the YIN monophonic pitch detection algorithm on the audio source directly — no external MIDI reference needed. Samples a window from ~30% into each note (to hit steady-state vowel, avoiding the attack transient). Falls back to Default pitch when the algorithm cannot find a confident pitch estimate. `Apply pitch changes` works in this mode.
 
 #### YIN parameters
 
@@ -175,6 +175,20 @@ A button at the top of the YIN sub-section (enabled only when Pitch source = Bui
 **Parameters swept.** `yin_threshold`, `yin_min_hz`, `yin_max_hz`, `yin_window_ms`. Pitch range constraints are deliberately excluded — they address octave correction, not pitch-class accuracy, and including them would conflate the two problems.
 
 **`FineCandidates`** — module-level utility function shared by both `AutoTune` and `AutoTuneYIN`. Moved from nested local inside `AutoTune` to module level so both functions can call it.
+
+### Slide Scan parameters (Pitch slide tab)
+
+Controls for the Scan pitch slides action. All five values are persisted with project settings.
+
+| Setting | Range | Default | What it does |
+|---|---|---|---|
+| **Min note length (ms)** | 20 – 300 | 80 ms | Notes shorter than this are skipped entirely. |
+| **Min segment (ms)** | 5 – 100 | 20 ms | A detected pitch run shorter than this is discarded. Increase to suppress false positives. |
+| **Edge skip (ms)** | 0 – 50 | 20 ms | Skip the start and end of each note before sampling. Hides consonant artifacts at note boundaries. |
+| **Sample step (ms)** | 5 – 50 | 10 ms | How often pitch is sampled along the note. Smaller = more resolution but slower. |
+| **Sample window (ms)** | 10 – 50 | 20 ms | YIN analysis window per sample point. Longer = more stable detection. |
+
+The scan also uses the current YIN threshold and frequency range settings from the Pitch tab.
 
 ### Pitch range constraints
 
@@ -243,7 +257,7 @@ Window size is a quality/speed trade-off, not a fit-to-reference parameter. Lett
 Every slider tooltip ends with a Ctrl+click hint. Implemented as a thin helper that appends the hint, so all sliders get it consistently and TIPS strings stay clean. Buttons use `Tooltip` (no hint).
 
 ### 7. `Apply pitch changes` is opt-in, not automatic
-Doesn't run as part of Generate. Separate button, separate flow, separate target resolution (`ResolveApplyPitchTarget` allows partially-overlapping MIDI items, unlike `FindMIDIItem` which requires full coverage). Disabled in Single pitch mode (would just overwrite every note with the same pitch — useless).
+Doesn't run as part of Generate. Separate button, separate flow, separate target resolution (`ResolveApplyPitchTarget` allows partially-overlapping MIDI items, unlike `FindMIDIItem` which requires full coverage). Always enabled — both pitch sources (YIN and Reference MIDI) are meaningful for re-pitching existing notes.
 
 ### 8. Time selection is the primary scope mechanism
 Almost everything respects time selection: detection range, auto-tune range, apply-pitch range. Without a time selection, actions fall back to whole-item or whole-track defaults. This is the iteration mechanism — work one section at a time.
@@ -381,7 +395,7 @@ No test framework — REAPER scripts are tested by running them. Manual checks I
 - [ ] Generate respects the `Min offset` rule (visible in the MIDI editor as gaps).
 - [ ] Auto-tune produces reasonable values for a section with hand-placed reference notes; result panel shows accuracy stats.
 - [ ] Apply pitch changes preserves note positions and lengths but updates pitches.
-- [ ] Apply pitch changes is disabled when Pitch source = Single.
+- [ ] Apply pitch changes is always enabled; works for Built-in detection and Reference MIDI.
 - [ ] Apply pitch changes works with YIN mode (pitch detection runs against audio source track).
 - [ ] YIN mode: Generate assigns non-default pitches for pitched vocal audio.
 - [ ] YIN mode: notes where pitch is ambiguous fall back to the Default pitch without error.
@@ -411,7 +425,12 @@ No test framework — REAPER scripts are tested by running them. Manual checks I
 - [ ] Timestamps in result panel show measure number and correct mm:ss format for positions ≥ 60 s.
 - [ ] Tab bar renders with 5 tabs; switching tabs does not clear `S.status` / `S.last_result`.
 - [ ] MIDI destination combo appears first (above tab bar); changing it is reflected across all tabs.
-- [ ] Scan pitch slides (Validation tab): shows warning dialog when no time selection; result appears in global panel below tab bar.
+- [ ] Scan pitch slides (Pitch slide tab): shows warning dialog when no time selection; result appears in global panel below tab bar.
+- [ ] Pitch slide tab: Slide Scan section (5 sliders + geometric warning) + YIN Detection section (3 sliders) + Scan button.
+- [ ] Reset##slides restores slide sliders only; Reset##yin restores YIN sliders only.
+- [ ] YIN threshold changed on Pitch slide tab is immediately visible on Pitch tab (same S.yin_* state).
+- [ ] Save → modify slide sliders → reload project → values restored.
+- [ ] Result summary line shows the current Min note length value, not hardcoded "80ms".
 
 ---
 
@@ -427,7 +446,7 @@ Not in scope right now but worth keeping in mind so we don't paint ourselves int
 - **Local-peak-aware splitting.** Replacing the global-peak split rule with per-syllable local peaks for phrases with very uneven dynamics.
 - **Persist track selections across sessions.** Use `GetTrackGUID` to store the selected tracks in project state. Smart defaults (`SetDefaultTracks`) partially cover this for standard project layouts.
 
-- **Tab-based UI layout — implemented in v1.3.** Five tabs: **General** (settings save/load), **Note Placement** (detection sliders + MIDI output + Generate), **Pitch** (pitch source + YIN + Apply pitch changes), **Lyrics** (file selection + assign/clear), **Validation** (Scan pitch slides + future checks). Track selectors (MIDI first, then audio) and the status/result panel are global — rendered above and below the tab bar so they're always visible. Future additions to Validation tab: slide detection sensitivity sliders (waiting on user feedback), additional advisory checks (phrase note rules, gap checks, note length warnings).
+- **Tab-based UI layout — implemented in v1.3, evolved through v1.6.** Five tabs: **General** (settings save/load), **Note Placement** (detection sliders + MIDI output + Default pitch slider + Generate), **Pitch** (Built-in detection | Reference MIDI + Apply pitch changes), **Lyrics** (file selection + assign/clear), **Pitch slide** (Scan pitch slides with Slide Scan sliders + YIN Detection sliders). The tab previously named Validation was renamed to Pitch slide in v1.5. In v1.6, Single pitch mode was removed from the Pitch tab; Generate/Dry run always use the Default pitch (on Note Placement tab); Apply pitch changes is always enabled; YIN is the new default pitch source. A future Validation tab will hold other read-only advisory checks.
 
 - **Lyrics syllable hint (opt-in, advisory only).** After Assign lyrics, flag tokens that appear to contain multiple syllables without a hyphen — e.g. `"wonderful"` where the user likely meant `"won-"` + `"der-"` + `"ful"`. Reported as an advisory line in the result panel, never blocking. Key design notes:
   - **Algorithm.** Count vowel-letter groups per token (e.g. `"won"→[o]`, `"der"→[e]`, `"ful"→[u]` = 3 groups → warn). Strip a trailing silent `e` before counting (`"smiles"→"smils"→[i]` = 1 group → no false positive). Tokens that already contain a hyphen are skipped.

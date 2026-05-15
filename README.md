@@ -33,46 +33,52 @@ The script checks both on startup: if ReaImGui is missing it shows an install pr
 2. Run the script. The window opens and attempts to auto-select the right tracks (it looks for tracks named `VOCALS AUDIO` / `DRYVOX1` for audio and `PART VOCALS` for MIDI destination).
 3. Confirm the track selections in the dropdowns if needed.
 4. Click **Dry run** to see how many notes would be detected with the current settings.
-5. Click **Generate notes (append)** to write the notes into your MIDI item.
+5. Click **Generate (append)** to write the notes into your MIDI item.
 
 ---
 
-## UI overview
+## Window overview
 
 ![Main window](assets/full_window.jpg)
 
-The window is divided into five main sections:
+The script window has a persistent track-selector row at the top and a status/result panel at the bottom. Everything in between is organised into five tabs:
 
-| Section         | Purpose                                                                      |
-| --------------- | ---------------------------------------------------------------------------- |
-| Track selection | Choose audio source, MIDI destination, and (optionally) reference MIDI track |
-| Note Detection  | Sliders that control when and how syllables are detected                     |
-| Pitch source    | Choose how MIDI pitch is assigned to each detected note                      |
-| MIDI output     | Velocity slider, action buttons, result panel                                |
-| Lyrics          | Select a lyrics file and assign words to the generated notes                 |
+| Area                   | Description                                                                      |
+| ---------------------- | -------------------------------------------------------------------------------- |
+| Track selectors        | Above the tab bar — Audio source, MIDI destination; always visible               |
+| **Note Placement** tab | Detection sliders, Default pitch, velocity, Dry run / Generate buttons           |
+| **Pitch** tab          | Pitch source for Apply pitch changes: Built-in detection (YIN) or Reference MIDI |
+| **Lyrics** tab         | Select a lyrics file, assign or clear lyric events                               |
+| **Pitch slide** tab    | Scan existing notes for pitch slides (glides, scoops, bends)                     |
+| **General** tab        | Save / Load project settings                                                     |
+| Status panel           | Below the tab bar — result of the last action                                    |
 
 ---
 
-## Workflow
-
-### Step 1 — Set up your tracks
+## Setting up your tracks
 
 You need two tracks before running the script:
 
 - **Audio source track** — contains the vocal stem (an isolated vocals-only audio file, e.g. from an AI stem separator like Demucs or UVR).
 - **MIDI destination track** — contains a MIDI item that spans the region you want to work on. The script writes into this existing item; it will not create a new one.
 
-If you plan to use **Reference MIDI** as the pitch source, add a third track containing the reference notes.
+If you plan to use **Reference MIDI** as the pitch source on the Pitch tab, add a third track containing the reference notes.
 
-### Step 2 — (Optional) Make a time selection
+---
 
-If you only want to process part of the song, make a time selection in REAPER before running any action. The script respects the time selection for all operations: detection, auto-tune, apply pitch changes, and lyric assignment.
+## Time selection
+
+If you only want to process part of the song, make a time selection in REAPER before running any action. The script respects the time selection for detection, auto-tune, apply pitch changes, and pitch slide scanning.
 
 Without a time selection, the full audio item is analysed.
 
-### Step 3 — Tune the Detection settings
+---
 
-![Note detection section](assets/note_detection.jpg)
+## Note Placement tab
+
+### Detection settings
+
+![Note Placement tab](assets/note_detection.jpg)
 
 The Detection sliders control the audio energy analysis. Start with defaults and adjust based on what Dry run reports.
 
@@ -87,57 +93,22 @@ The Detection sliders control the audio energy analysis. Start with defaults and
 
 > **Tip:** All sliders support Ctrl+click to type an exact value.
 
-### Step 4 — Choose a Pitch source
+### MIDI output
 
-![Pitch source section](assets/pitch_source.jpg)
+- **Velocity** — MIDI velocity assigned to every generated note (1–127).
+- **Default pitch** — the fixed pitch used by Generate and Dry run for every note. Also serves as the fallback when Reference MIDI or Built-in detection cannot assign a pitch to a note. Displayed using Rock Band octave numbering (C1 = MIDI 36, C5 = MIDI 84).
 
-Select how MIDI pitch is assigned to each detected note:
+### Generating notes
 
-#### Single pitch
+- **Dry run** — runs the full detection pipeline but does not write anything to REAPER. Reports how many notes were found and other stats.
+- **Generate (append)** — writes notes into the destination MIDI item. Before inserting, it clears existing notes at the pitches it will produce (plus the Default pitch) within the analysis range, so re-running is safe and does not stack duplicates.
+- **Generate (replace)** — clears _all_ notes in the vocal pitch range (C1–C5) within the analysis range first, then inserts the new notes. Notes at other pitches (phrase markers at pitch 105, etc.) are preserved. Use this when you want a completely fresh result with no leftover notes from previous runs.
 
-Every note is assigned the same pitch (the **Default pitch** slider). Use this when pitch doesn't matter yet — you just want timing data — or when your game engine uses a single note row for vocals.
-
-#### Reference MIDI
-
-Pitch is taken from an existing MIDI track. For each detected note, the script finds the nearest MIDI note on the reference track (within the **Search tolerance** window) and uses that pitch. Falls back to Default pitch when nothing is within range.
-
-This works well with MIDI output from AI pitch tools like [Basic Pitch](https://basicpitch.spotify.com/). Import the AI MIDI output onto the reference track, then use this mode to transfer those pitches onto your timing-detected notes.
-
-#### Built-in detection (YIN)
-
-The script analyses the audio directly using the [YIN algorithm](http://audition.ens.fr/adc/pdf/2002_JASA_YIN.pdf) to estimate the fundamental frequency of each note. No external MIDI reference needed.
-
-| Slider            | Range         | Default | Notes                                                                                                                   |
-| ----------------- | ------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
-| **YIN threshold** | 0.01 – 0.5    | 0.15    | Confidence cutoff. Lower = stricter (more fallbacks to Default pitch). Higher = more detections but more octave errors. |
-| **Min frequency** | 40 – 400 Hz   | 80 Hz   | Set to just below the lowest note in the vocal.                                                                         |
-| **Max frequency** | 200 – 2000 Hz | 1000 Hz | Set to just above the highest note.                                                                                     |
-| **YIN window**    | 10 – 100 ms   | 30 ms   | Audio length analysed per note. Longer is more stable but may miss very short notes.                                    |
-
-The algorithm samples audio starting at 30% into each note (to avoid the attack transient and land on the steady-state vowel). Notes where no confident pitch is found fall back to Default pitch.
-
-> **Tip:** If YIN produces consistent pitch errors across a section, use **Auto-tune YIN from reference** to automatically search for better settings — see [Auto-tune YIN from reference](#auto-tune-yin-from-reference) below.
-
-#### Pitch range constraints (min / max)
-
-Two optional checkbox+slider pairs clamp or octave-shift pitches into a target range. When a detected pitch is outside the range, the script first tries octave-shifting it back in (±12 semitones, up to 16 attempts), then falls back to clamping. Useful for correcting octave errors from AI stem separation.
-
-> **Example:** Max pitch set to 72 (C5). A detected pitch of 84 (C6) is shifted down one octave to 72 — within range, accepted. A detected pitch of 86 with Min = 60 and Max = 72 has no octave that fits inside a 12-semitone window, so it clamps to the nearer endpoint (72).
-
-### Step 5 — Dry run and Generate
-
-![Action button section](assets/actions.jpg)
-
-- **Dry run** — runs the full detection and pitch assignment pipeline but does not write anything to REAPER. Reports how many notes were found, how many pitches were matched or fell back to default, etc.
-- **Generate notes (append)** — writes notes into the destination MIDI item. Before inserting, it clears any existing notes at the pitches it is about to write (within the analysis range), so re-running is safe and does not stack duplicates.
-
-The result panel below the buttons shows counts for the last action.
+The result panel below the tab bar shows counts for the last action.
 
 ---
 
 ## Auto-tune from reference
-
-![Auto-tune usage](assets/auto_tune_from_reference.jpg)
 
 Auto-tune automates the process of finding Detection slider values that reproduce a set of manually-placed timing reference notes.
 
@@ -156,13 +127,44 @@ The script runs a coordinate descent search over five detection parameters (**RM
 
 ---
 
-## Auto-tune YIN from reference
+## Pitch tab
+
+The Pitch tab controls how **Apply pitch changes** re-pitches existing notes on the destination track. **Generate and Dry run always use the Default pitch** (set on the Note Placement tab) and are not affected by anything on this tab.
+
+![Pitch tab](assets/pitch_source.jpg)
+
+### Pitch source
+
+Two radio buttons select how existing notes are re-pitched when you click Apply pitch changes:
+
+#### Built-in detection (YIN)
+
+The script analyses the audio directly using the [YIN algorithm](http://audition.ens.fr/adc/pdf/2002_JASA_YIN.pdf) to estimate the fundamental frequency of each note. No external MIDI reference needed. This is the default.
+
+| Slider            | Range         | Default | Notes                                                                                                                   |
+| ----------------- | ------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
+| **YIN threshold** | 0.01 – 0.5    | 0.15    | Confidence cutoff. Lower = stricter (more fallbacks to Default pitch). Higher = more detections but more octave errors. |
+| **Min frequency** | 40 – 400 Hz   | 80 Hz   | Set to just below the lowest note in the vocal.                                                                         |
+| **Max frequency** | 200 – 2000 Hz | 1000 Hz | Set to just above the highest note.                                                                                     |
+| **YIN window**    | 10 – 100 ms   | 30 ms   | Audio length analysed per note. Longer is more stable but may miss very short notes.                                    |
+
+The algorithm samples audio starting at 30% into each note (to avoid the attack transient and land on the steady-state vowel). Notes where no confident pitch is found fall back to Default pitch.
+
+> **Tip:** If YIN produces consistent pitch errors across a section, use **Auto-tune YIN from reference** to automatically search for better settings.
+
+#### Reference MIDI
+
+Pitch is taken from an existing MIDI track. For each note, the script finds the nearest MIDI note on the reference track (within the **Search tolerance** window) and uses that pitch. Falls back to Default pitch when nothing is within range.
+
+This works well with MIDI output from AI pitch tools like [Basic Pitch](https://basicpitch.spotify.com/). Import the AI MIDI output onto the reference track, then use this mode to transfer those pitches onto your timing-detected notes.
+
+### Auto-tune YIN from reference
 
 Auto-tune YIN automates finding better YIN parameter values when pitch detection produces consistently wrong results across a section.
 
 **How to use it:**
 
-1. Run **Generate notes (append)** in Built-in detection (YIN) mode to produce an initial set of notes.
+1. Run **Generate (append)** to produce an initial set of notes.
 2. In REAPER's MIDI editor, manually correct the pitches of a representative handful of notes — keep their positions and lengths unchanged.
 3. Make a time selection covering those corrected notes.
 4. Click **Auto-tune YIN from reference** (the button appears above the YIN sliders, active only when Pitch source = Built-in detection).
@@ -172,8 +174,8 @@ The script reads the existing note positions from the MIDI item, sweeps combinat
 **Scoring is octave-insensitive.** The search measures pitch-class distance — C→C# scores better than C→F, regardless of octave. This separates pitch-class accuracy (what parameter settings affect) from octave correctness (what pitch range constraints fix). Octave mismatches that remain after the search are counted and reported, with a specific suggestion for pitch range constraint values to correct them:
 
 ```
-Octave mismatches: 3 — reference spans C3–G4
-  Consider enabling pitch range: min 48 (C3), max 67 (G4)
+Octave mismatches: 3 — reference spans C2–G3
+  Consider enabling pitch range: min 48 (C2), max 67 (G3)
 ```
 
 **What it changes:** YIN threshold, Min frequency, Max frequency, YIN window.
@@ -183,24 +185,28 @@ Octave mismatches: 3 — reference spans C3–G4
 
 > **Tip:** Use 10–20 reference notes covering a range of pitches in the section. Notes where pitch was already correct do not need to be touched — the search still converges from partial corrections, and more representative notes produce better results.
 
----
+### Pitch range constraints (min / max)
 
-## Apply pitch changes
+Two optional checkbox+slider pairs clamp or octave-shift pitches into a target range. When a detected pitch is outside the range, the script first tries octave-shifting it back in (±12 semitones, up to 16 attempts), then falls back to clamping. Useful for correcting octave errors from AI stem separation.
+
+> **Example:** Max pitch set to 72 (C4). A detected pitch of 84 (C5) is shifted down one octave to 72 — within range, accepted. A detected pitch of 86 with Min = 60 and Max = 72 has no octave that fits inside a 12-semitone window, so it clamps to the nearer endpoint (72).
+
+### Apply pitch changes
 
 **Apply pitch changes** reassigns the pitches of existing notes on the destination track without altering their position or length. Use this when:
 
 - You've manually adjusted note timing and now want to add pitch information.
 - You want to re-pitch notes after changing the Pitch source settings without re-running detection.
 
-The button is disabled when Pitch source is set to Single pitch (it would just overwrite every note with the same pitch, which is not useful).
+The button is always active. Both pitch sources are meaningful for re-pitching existing notes.
 
 ---
 
-## Lyrics
+## Lyrics tab
 
 ![Lyrics section](assets/lyrics.jpg)
 
-The Lyrics section assigns words from a plain-text file to the MIDI notes on the destination track as lyric text events (the same format REAPER's native lyric tools use).
+The Lyrics tab assigns words from a plain-text file to the MIDI notes on the destination track as lyric text events (the same format REAPER's native lyric tools use).
 
 > **Note on RB3 conventions:** Lyric assignment operates on notes within the RB3 vocal range (C1–C5, MIDI pitches 36–84), and the phrase capitalization check uses pitch 105 as the phrase-boundary marker. These are Rock Band 3 standards; if you author for a different game with a different convention, the script's behaviour here may need adjusting.
 
@@ -256,28 +262,60 @@ After **Assign lyrics** the result panel shows:
 
 ---
 
+## Pitch slide tab
+
+![Lyrics section](assets/pitch_slide.jpg)
+
+The **Pitch slide** tab scans existing MIDI notes on the destination track and reports any where the detected pitch moves significantly during the note — slides, scoops, bends, and other pitch curves that a Rock Band vocal chart may need to represent explicitly.
+
+> **This action is read-only.** It never modifies notes; it only reports findings.
+
+### How to use it
+
+1. Generate notes onto the destination track first.
+2. (Optional) Make a time selection to limit the scan.
+3. Click **Scan pitch slides**.
+
+If no time selection is active, a confirmation dialog appears before scanning the whole song.
+
+The result panel lists every note where a slide was detected, with its position, length, pitch, and movement type (Slide up, Slide down, Scoop, Bend, or Complex). Use the measure numbers to jump directly to each note in REAPER.
+
+### Slide Scan settings
+
+| Slider              | Range       | Default | What it does                                                                                       |
+| ------------------- | ----------- | ------- | -------------------------------------------------------------------------------------------------- |
+| **Min note length** | 20 – 300 ms | 80 ms   | Notes shorter than this are skipped entirely.                                                      |
+| **Min segment**     | 5 – 100 ms  | 20 ms   | A detected pitch run shorter than this is discarded. Increase to suppress false positives.         |
+| **Edge skip**       | 0 – 50 ms   | 20 ms   | Skip the start and end of each note before sampling. Hides consonant artifacts at note boundaries. |
+| **Sample step**     | 5 – 50 ms   | 10 ms   | How often pitch is sampled along the note. Smaller = more resolution but slower.                   |
+| **Sample window**   | 10 – 50 ms  | 20 ms   | YIN analysis window per sample point. Longer = more stable detection.                              |
+
+The scan also uses the **YIN threshold**, **Min frequency**, and **Max frequency** settings from the Pitch tab.
+
+---
+
+## General tab
+
+Settings are saved per-project using REAPER's project state. Click **Save** to store the current Detection and Pitch settings. Click **Load** to restore them.
+
+Settings are loaded automatically when the script opens (if a save exists for the current project) and when you switch REAPER project tabs.
+
+**What is saved:** all Detection sliders, Pitch source selection and all pitch settings (including YIN parameters), Velocity, Slide Scan settings.
+
+**What is not saved:** track selections. If your project follows the naming convention (`VOCALS AUDIO`, `PART VOCALS`) the script will re-select the right tracks automatically.
+
+---
+
 ## Undo
 
 The **Undo** button directly calls REAPER's undo. It exists because the ImGui window captures keyboard focus, so REAPER's own Ctrl+Z shortcut does not fire while the script window is active. The button is disabled when there is nothing to undo, and the tooltip shows the label of the operation that will be undone.
 
 ---
 
-## Save and Load
-
-Settings are saved per-project using REAPER's project state. Click **Save** to store the current Detection and Pitch settings. Click **Load** to restore them.
-
-Settings are loaded automatically when the script opens (if a save exists for the current project) and when you switch REAPER project tabs.
-
-**What is saved:** all Detection sliders, Pitch source selection and all pitch settings (including YIN parameters), Velocity.
-
-**What is not saved:** track selections. If your project follows the naming convention (`VOCALS AUDIO`, `PART VOCALS`) the script will re-select the right tracks automatically.
-
----
-
 ## Tips
 
-- **Start with Single pitch mode** to get the timing right first, then switch to a pitch source and use Apply pitch changes to add pitch data without re-running detection.
-- **Use a time selection to work section by section.** Chorus and verse may need different threshold settings. Generate into the same MIDI item repeatedly; each run only touches notes at the pitches it produces.
+- **Use Generate (append) for iteration, Generate (replace) for a clean slate.** Append mode re-runs safely without stacking duplicates (clears only the pitches it's about to write). Replace mode wipes all vocal-range notes in the range — useful when detection settings have changed significantly and you want a completely fresh result.
+- **Use a time selection to work section by section.** Chorus and verse may need different threshold settings. Generate into the same MIDI item repeatedly; each run only touches its own range.
 - **Low-pass cutoff makes a big difference** for sibilant-heavy vocals. If note starts consistently land on the consonant instead of the vowel, enable the low-pass filter around 1500–2000 Hz.
 - **Reference MIDI mode + Basic Pitch** is a good combination: Basic Pitch provides reasonable pitch estimates that you can refine with the pitch range constraints, while the script provides tighter timing than Basic Pitch alone.
 - **Auto-tune works best with 10–30 representative reference notes** covering the range of dynamics in the section.
