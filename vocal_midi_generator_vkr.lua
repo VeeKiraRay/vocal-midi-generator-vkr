@@ -1,6 +1,6 @@
 -- @description Vocal MIDI Generator
 -- @author VeeKiraRay
--- @version 1.1
+-- @version 1.2
 -- @about
 --   Analyses a vocal audio track and appends MIDI notes to an existing MIDI
 --   item on a destination track, one note per detected syllable or phrase.
@@ -9,6 +9,12 @@
 --   parameters to manually-placed reference timing notes.
 --
 --   Built with Claude (Anthropic) — https://claude.ai
+--
+--   v1.2
+--     - Added Scan pitch slides: scans existing MIDI notes and reports any
+--       where pitch moves significantly during the note (Slide up/down,
+--       Scoop, Bend, Complex slide). Read-only; respects time selection.
+--       Includes lyric text in the report when present.
 --
 --   v1.1
 --     - Added Auto-tune YIN from reference: sweeps YIN parameters
@@ -449,6 +455,27 @@ local TIPS = {
         "constraints to fix any octave errors afterward.\n\n" ..
         "Only available when Pitch source is Built-in detection.\n\n" ..
         "Use 'Save' first to preserve your current values.",
+
+    scan_slides =
+        "Scan existing notes on the destination MIDI item and report any\n" ..
+        "where pitch moves significantly during the note.\n\n" ..
+        "Uses the audio source track to sample pitch at multiple points\n" ..
+        "inside each note (via YIN), then classifies the trajectory:\n" ..
+        "  Slide up    — pitch rises through the note\n" ..
+        "  Slide down  — pitch falls through the note\n" ..
+        "  Scoop       — dips then rises (e.g. start mid, drop, go high)\n" ..
+        "  Bend        — rises then falls\n" ..
+        "  Complex slide — three or more direction changes\n\n" ..
+        "Stable notes are not reported. Notes shorter than 80ms are skipped.\n" ..
+        "Requires at least two detected pitches each lasting 20ms or more\n" ..
+        "inside the note to count as a slide.\n" ..
+        "Octave detection errors (C3 vs C5) are ignored — only pitch-class\n" ..
+        "changes trigger a slide report.\n\n" ..
+        "Uses the current YIN threshold and frequency range settings.\n\n" ..
+        "Scope:\n" ..
+        " - With time selection: scans notes within the selection.\n" ..
+        " - Without time selection: scans all notes on the MIDI item.\n\n" ..
+        "Read-only — does not modify the project.",
 
     lyrics_auto_detect =
         "Look for 'lyrics.txt' in the current project folder and select it " ..
@@ -1048,6 +1075,77 @@ local function DetectPitchYIN(ctx, note_s, note_e)
     end
 
     -- Parabolic interpolation for sub-sample period precision
+    if tau_est > tau_min and tau_est < tau_max then
+        local s0, s1, s2 = d[tau_est - 1], d[tau_est], d[tau_est + 1]
+        local denom = 2 * s1 - s0 - s2
+        if math.abs(denom) > 1e-10 then
+            tau_est = tau_est + (s0 - s2) / (2 * denom)
+        end
+    end
+
+    local freq = sr / tau_est
+    if freq < S.yin_min_freq or freq > S.yin_max_freq then return nil end
+    return math.floor(69 + 12 * math.log(freq / 440) / math.log(2) + 0.5)
+end
+
+-- Variant of DetectPitchYIN that samples at an explicit project time instead
+-- of the 30%-into-note heuristic. Used by ScanPitchSlidesAction for multi-
+-- point sampling along a note.
+local function SampleYINAt(yctx, t_sample, win_s)
+    local sr, nch = yctx.sr, yctx.nch
+    if win_s < 0.01 then return nil end
+
+    local n_samps = math.max(2, math.floor(win_s * sr))
+    local tau_min = math.max(1, math.floor(sr / S.yin_max_freq))
+    local tau_max = math.min(
+        math.floor(sr / S.yin_min_freq),
+        math.floor(n_samps / 2) - 1)
+    if tau_max < tau_min then return nil end
+
+    local t_off = t_sample - yctx.item_pos
+    if t_off < 0 then t_off = 0 end
+
+    local buf = r.new_array(n_samps * nch)
+    buf.clear()
+    r.GetAudioAccessorSamples(yctx.accessor, sr, nch, t_off, n_samps, buf)
+
+    local mono = {}
+    for i = 1, n_samps do
+        local s = 0
+        for c = 0, nch - 1 do s = s + buf[(i - 1) * nch + c + 1] end
+        mono[i] = nch > 1 and s / nch or s
+    end
+
+    local d = {}
+    d[0] = 0
+    local running_sum = 0
+    for tau = 1, tau_max do
+        local sq = 0
+        for j = 1, n_samps - tau do
+            local diff = mono[j] - mono[j + tau]
+            sq = sq + diff * diff
+        end
+        running_sum = running_sum + sq
+        d[tau] = (running_sum > 0) and (sq * tau / running_sum) or 1
+    end
+
+    local tau_est = nil
+    for tau = tau_min, tau_max - 1 do
+        if d[tau] < S.yin_threshold then
+            while tau < tau_max and d[tau + 1] < d[tau] do tau = tau + 1 end
+            tau_est = tau
+            break
+        end
+    end
+    if not tau_est then
+        local min_d, min_tau = math.huge, tau_min
+        for tau = tau_min, tau_max do
+            if d[tau] < min_d then min_d = d[tau]; min_tau = tau end
+        end
+        if min_d > 0.5 then return nil end
+        tau_est = min_tau
+    end
+
     if tau_est > tau_min and tau_est < tau_max then
         local s0, s1, s2 = d[tau_est - 1], d[tau_est], d[tau_est + 1]
         local denom = 2 * s1 - s0 - s2
@@ -2204,6 +2302,325 @@ local function ApplyPitchChangesAction()
     S.last_result = table.concat(lines, '\n')
 end
 
+----------------------------------------------------------------------
+-- Pitch slide scan
+----------------------------------------------------------------------
+-- Constants for the scan (not user-configurable yet — wait for feedback)
+local SLIDE_MIN_NOTE_S = 0.080  -- skip notes shorter than 80ms
+local SLIDE_STEP_S     = 0.010  -- sample pitch every 10ms
+local SLIDE_WIN_S      = 0.020  -- YIN analysis window per sample (20ms)
+local SLIDE_SKIP_S     = 0.020  -- skip first/last 20ms to avoid consonants
+local SLIDE_MIN_SEG_S  = 0.020  -- minimum pitch-segment duration to count
+
+-- Classify the shape of a pitch trajectory from a list of pitch segments.
+-- segs: list of {pc, median_midi, ...}, 2 or more entries, adjacent entries
+-- always have different pitch classes (guaranteed by the merge step).
+-- Returns one of: 'Slide up', 'Slide down', 'Scoop', 'Bend', 'Complex slide'.
+local function ClassifySlide(segs)
+    local dirs = {}
+    for i = 2, #segs do
+        local diff = segs[i].median_midi - segs[i - 1].median_midi
+        dirs[#dirs + 1] = diff > 0 and 1 or -1
+    end
+
+    local all_up, all_down = true, true
+    for _, d in ipairs(dirs) do
+        if d < 0 then all_up   = false end
+        if d > 0 then all_down = false end
+    end
+    if all_up   then return 'Slide up'   end
+    if all_down then return 'Slide down' end
+
+    local first, last = dirs[1], dirs[#dirs]
+    if first < 0 and last > 0 then return 'Scoop' end
+    if first > 0 and last < 0 then return 'Bend'  end
+    return 'Complex slide'
+end
+
+local function ScanPitchSlidesAction()
+    local tracks = GetTrackList()
+    if #tracks == 0 then S.status = 'No tracks in project.'; S.last_result = nil; return end
+    if S.audio_idx >= #tracks or S.midi_idx >= #tracks then
+        S.status = 'Track selection out of range.'; S.last_result = nil; return
+    end
+
+    local audio_track = r.GetTrack(0, tracks[S.audio_idx + 1].idx)
+    local midi_track  = r.GetTrack(0, tracks[S.midi_idx  + 1].idx)
+
+    -- Find first audio item on the source track
+    local audio_item
+    for i = 0, r.CountTrackMediaItems(audio_track) - 1 do
+        local item = r.GetTrackMediaItem(audio_track, i)
+        local take = r.GetActiveTake(item)
+        if take and not r.TakeIsMIDI(take) then audio_item = item; break end
+    end
+    if not audio_item then
+        S.status = 'Error'
+        S.last_result = 'No audio item found on the source track.'
+        return
+    end
+
+    -- Find MIDI item and establish scan range (respects time selection)
+    local sel_start, sel_end = GetTimeSelection()
+
+    if not sel_start then
+        local proceed = r.ShowMessageBox(
+            'No time selection is active.\n\n' ..
+            'Scan pitch slides will process the entire destination MIDI item.\n' ..
+            'On a full song this can take 20 seconds or more, and the UI\n' ..
+            'will be unresponsive until the scan completes.\n\n' ..
+            'Save your project first in case of an unexpected crash.\n\n' ..
+            'Press OK to continue, or Cancel to set a time selection first.',
+            'Scan pitch slides — no time selection', 1)
+        if proceed ~= 1 then return end
+    end
+
+    local midi_item, midi_take, range_start, range_end, has_sel
+
+    if sel_start then
+        for i = 0, r.CountTrackMediaItems(midi_track) - 1 do
+            local item = r.GetTrackMediaItem(midi_track, i)
+            local take = r.GetActiveTake(item)
+            if take and r.TakeIsMIDI(take) then
+                local pos = r.GetMediaItemInfo_Value(item, 'D_POSITION')
+                local len = r.GetMediaItemInfo_Value(item, 'D_LENGTH')
+                if pos < sel_end and pos + len > sel_start then
+                    midi_item = item; midi_take = take
+                    range_start = sel_start; range_end = sel_end
+                    has_sel = true; break
+                end
+            end
+        end
+    end
+    if not midi_item then
+        midi_item, midi_take = FindFirstMIDIItem(midi_track)
+        if not midi_item then
+            S.status = 'Error'
+            S.last_result = 'No MIDI item found on the destination track.'
+            return
+        end
+        range_start = r.GetMediaItemInfo_Value(midi_item, 'D_POSITION')
+        range_end   = range_start + r.GetMediaItemInfo_Value(midi_item, 'D_LENGTH')
+        has_sel = false
+    end
+
+    -- Build PPQ -> lyric lookup from type-5 text events
+    local lyric_at = {}
+    local _, _, _, n_text = r.MIDI_CountEvts(midi_take)
+    for i = 0, n_text - 1 do
+        local ok, _, _, ppq, typ, msg = r.MIDI_GetTextSysexEvt(midi_take, i)
+        if ok and typ == 5 then lyric_at[ppq] = msg end
+    end
+
+    -- Read notes in range (RB3 vocal pitch range only)
+    local _, n_notes = r.MIDI_CountEvts(midi_take)
+    local notes = {}
+    for i = 0, n_notes - 1 do
+        local ok, _, _, sppq, eppq, _, pitch = r.MIDI_GetNote(midi_take, i)
+        if ok then
+            local s_t = r.MIDI_GetProjTimeFromPPQPos(midi_take, sppq)
+            local e_t = r.MIDI_GetProjTimeFromPPQPos(midi_take, eppq)
+            if s_t >= range_start - 0.001 and s_t < range_end + 0.001
+            and pitch >= RB3_MIN_PITCH and pitch <= RB3_MAX_PITCH then
+                notes[#notes + 1] = {
+                    s = s_t, e = e_t, pitch = pitch, lyric = lyric_at[sppq],
+                }
+            end
+        end
+    end
+
+    if #notes == 0 then
+        S.status = 'No notes in range.'
+        S.last_result = ('Range: %s - %s%s\nNo notes to scan.'):format(
+            FormatTime(range_start), FormatTime(range_end),
+            has_sel and ' [time selection]' or ' [whole MIDI item]')
+        return
+    end
+
+    local yctx, yerr = OpenYINContext(audio_item)
+    if not yctx then S.status = 'Error'; S.last_result = yerr; return end
+
+    local slide_results = {}
+    local n_scanned, n_too_short, n_stable = 0, 0, 0
+
+    for _, note in ipairs(notes) do
+        local dur = note.e - note.s
+        if dur < SLIDE_MIN_NOTE_S then
+            n_too_short = n_too_short + 1
+        else
+            n_scanned = n_scanned + 1
+
+            -- Collect YIN samples every SLIDE_STEP_S, skipping note edges
+            local scan_s = note.s + SLIDE_SKIP_S
+            local scan_e = note.e - SLIDE_SKIP_S
+            local raw = {}
+            local t = scan_s
+            while t + SLIDE_WIN_S <= scan_e do
+                local p = SampleYINAt(yctx, t, SLIDE_WIN_S)
+                raw[#raw + 1] = {
+                    t = t, midi = p, pc = p and (p % 12) or nil,
+                }
+                t = t + SLIDE_STEP_S
+            end
+
+            -- Group consecutive valid samples by pitch class
+            local segs = {}
+            local cur
+            for _, sp in ipairs(raw) do
+                if sp.pc then
+                    if not cur or cur.pc ~= sp.pc then
+                        cur = {
+                            pc = sp.pc, midi_list = { sp.midi },
+                            t_start = sp.t, t_end = sp.t + SLIDE_WIN_S,
+                        }
+                        segs[#segs + 1] = cur
+                    else
+                        cur.midi_list[#cur.midi_list + 1] = sp.midi
+                        cur.t_end = sp.t + SLIDE_WIN_S
+                    end
+                else
+                    cur = nil  -- gap resets the current segment
+                end
+            end
+
+            -- Compute median MIDI note and duration per segment
+            for _, seg in ipairs(segs) do
+                table.sort(seg.midi_list)
+                seg.median_midi = seg.midi_list[math.floor(#seg.midi_list / 2) + 1]
+                seg.duration = seg.t_end - seg.t_start
+            end
+
+            -- Filter: discard segments shorter than SLIDE_MIN_SEG_S
+            local filtered = {}
+            for _, seg in ipairs(segs) do
+                if seg.duration >= SLIDE_MIN_SEG_S then
+                    filtered[#filtered + 1] = seg
+                end
+            end
+
+            -- Merge adjacent segments that share a pitch class (after gap filtering)
+            local merged = {}
+            for _, seg in ipairs(filtered) do
+                if #merged > 0 and merged[#merged].pc == seg.pc then
+                    local last = merged[#merged]
+                    for _, v in ipairs(seg.midi_list) do
+                        last.midi_list[#last.midi_list + 1] = v
+                    end
+                    last.t_end    = seg.t_end
+                    last.duration = last.t_end - last.t_start
+                    table.sort(last.midi_list)
+                    last.median_midi =
+                        last.midi_list[math.floor(#last.midi_list / 2) + 1]
+                else
+                    merged[#merged + 1] = {
+                        pc         = seg.pc,
+                        midi_list  = seg.midi_list,
+                        t_start    = seg.t_start,
+                        t_end      = seg.t_end,
+                        duration   = seg.duration,
+                        median_midi = seg.median_midi,
+                    }
+                end
+            end
+
+            if #merged < 2 then
+                n_stable = n_stable + 1
+            else
+                local shape  = ClassifySlide(merged)
+                local from_p = merged[1].median_midi
+                local to_p   = merged[#merged].median_midi
+
+                -- Show the actual turning point, not just the middle index.
+                -- Scoop: deepest dip among inner segments.
+                -- Bend:  highest peak among inner segments.
+                -- Slide up/down and Complex slide: no mid_p (no single
+                -- representative point; Complex label conveys the complexity).
+                local mid_p, mid_dur = nil, nil
+                if shape == 'Scoop' and #merged >= 3 then
+                    local min_midi = math.huge
+                    for j = 2, #merged - 1 do
+                        if merged[j].median_midi < min_midi then
+                            min_midi = merged[j].median_midi
+                            mid_dur  = merged[j].duration
+                        end
+                    end
+                    mid_p = min_midi
+                elseif shape == 'Bend' and #merged >= 3 then
+                    local max_midi = -math.huge
+                    for j = 2, #merged - 1 do
+                        if merged[j].median_midi > max_midi then
+                            max_midi = merged[j].median_midi
+                            mid_dur  = merged[j].duration
+                        end
+                    end
+                    mid_p = max_midi
+                end
+
+                slide_results[#slide_results + 1] = {
+                    time       = note.s,
+                    note_dur   = note.e - note.s,
+                    note_pitch = note.pitch,
+                    lyric      = note.lyric,
+                    shape      = shape,
+                    from_p     = from_p,
+                    from_dur   = merged[1].duration,
+                    to_p       = to_p,
+                    to_dur     = merged[#merged].duration,
+                    mid_p      = mid_p,
+                    mid_dur    = mid_dur,
+                }
+            end
+        end
+    end
+
+    CloseYINContext(yctx)
+
+    -- Format result lines
+    local lines = {
+        ('Range: %s - %s%s'):format(
+            FormatTime(range_start), FormatTime(range_end),
+            has_sel and ' [time selection]' or ' [whole MIDI item]'),
+        ('%d notes  |  %d scanned  |  %d too short (<80ms)  |  %d stable')
+            :format(#notes, n_scanned, n_too_short, n_stable),
+    }
+
+    if #slide_results == 0 then
+        lines[#lines + 1] = ''
+        lines[#lines + 1] = 'No pitch slides detected.'
+    else
+        lines[#lines + 1] = ('%d slide%s detected:')
+            :format(#slide_results, #slide_results == 1 and '' or 's')
+        lines[#lines + 1] = ''
+        for _, res in ipairs(slide_results) do
+            local note_name = PitchName(res.note_pitch)
+            local lyric_tag = res.lyric
+                and ('(%s "%s") '):format(note_name, res.lyric)
+                or  ('(%s) '):format(note_name)
+            local nd = res.note_dur
+            local function pct(d)
+                return math.max(1, math.floor(d / nd * 100 + 0.5))
+            end
+            local pitch_str
+            if res.mid_p then
+                pitch_str = ('%s (%d%%) -> %s (%d%%) -> %s (%d%%)'):format(
+                    PitchName(res.from_p), pct(res.from_dur),
+                    PitchName(res.mid_p),  pct(res.mid_dur),
+                    PitchName(res.to_p),   pct(res.to_dur))
+            else
+                pitch_str = ('%s (%d%%) -> %s (%d%%)'):format(
+                    PitchName(res.from_p), pct(res.from_dur),
+                    PitchName(res.to_p),   pct(res.to_dur))
+            end
+            lines[#lines + 1] = ('%-26s  %s%-16s  %s'):format(
+                FormatTime(res.time), lyric_tag, res.shape, pitch_str)
+        end
+    end
+
+    S.status = ('%d pitch slide%s detected'):format(
+        #slide_results, #slide_results == 1 and '' or 's')
+    S.last_result = table.concat(lines, '\n')
+end
+
 local function ClearLyricsAction()
     local tracks = GetTrackList()
     if #tracks == 0 or S.midi_idx >= #tracks then
@@ -2409,6 +2826,7 @@ local function Loop()
         local bw_gen = r.ImGui_CalcTextSize(ctx, 'Generate notes (append)') + _bp
         local bw_app = r.ImGui_CalcTextSize(ctx, 'Apply pitch changes') + _bp
         local bw_und = r.ImGui_CalcTextSize(ctx, 'Undo') + _bp
+        local bw_sld = r.ImGui_CalcTextSize(ctx, 'Scan pitch slides') + _bp
         local bw_lad = r.ImGui_CalcTextSize(ctx, 'Auto-detect') + _bp
         local bw_lbr = r.ImGui_CalcTextSize(ctx, 'Browse...') + _bp
         local bw_lcl = r.ImGui_CalcTextSize(ctx, 'Clear lyrics') + _bp
@@ -2611,6 +3029,11 @@ local function Loop()
         end
         if not can_undo then r.ImGui_EndDisabled(ctx) end
         if can_undo then Tooltip('Undo: ' .. undo_str) end
+
+        if r.ImGui_Button(ctx, 'Scan pitch slides', bw_sld, 24) then
+            ScanPitchSlidesAction()
+        end
+        Tooltip(TIPS.scan_slides)
 
         ----------------------------------------------------------------
         -- Lyrics
