@@ -1,6 +1,6 @@
 -- @description Vocal MIDI Generator
 -- @author VeeKiraRay
--- @version 1.5
+-- @version 1.6
 -- @about
 --   Analyses a vocal audio track and appends MIDI notes to an existing MIDI
 --   item on a destination track, one note per detected syllable or phrase.
@@ -9,6 +9,14 @@
 --   parameters to manually-placed reference timing notes.
 --
 --   Built with Claude (Anthropic) — https://claude.ai
+--
+--   v1.6
+--     - Validation tab: Validate phrases checks all phrase-marker regions for
+--       six common authoring issues: lyric capitalization, grid snap (start and
+--       end on a 64th-note boundary), gap to the next phrase (>= 4x64th),
+--       first note lead (>= 2x64th from phrase start), and last note tail
+--       (>= 1x64th before phrase end). Read-only; reports violations grouped
+--       by phrase position.
 --
 --   v1.5
 --     - Generate (replace): new button clears all vocal-range notes in the
@@ -594,6 +602,19 @@ local TIPS = {
         "After assigning, the result panel shows count-mismatch warnings and a " ..
         "phrase capitalization check (first word after each phrase marker should " ..
         "start with an uppercase letter).",
+
+    validate_phrases =
+        "Check all phrases (pitch-105 marker regions) for common authoring issues.\n\n" ..
+        "Checks per phrase:\n" ..
+        "  1. First vocal note has a capitalized lyric\n" ..
+        "  2. Phrase marker start is on a 64th-note (or coarser) grid boundary\n" ..
+        "  3. Phrase marker end is on a 64th-note (or coarser) grid boundary\n" ..
+        "  4. Gap to the next phrase is at least 4 x 64th note\n" ..
+        "  5. First vocal note starts at least 2 x 64th notes after phrase start\n" ..
+        "  6. Last vocal note ends at least 1 x 64th note before phrase end\n\n" ..
+        "Violations are grouped by phrase position.\n\n" ..
+        "Operates on the whole take regardless of time selection.\n" ..
+        "Read-only — does not modify the project.",
 }
 
 ----------------------------------------------------------------------
@@ -629,6 +650,14 @@ local function FormatTime(t)
     local secs = t - mins * 60
     local ts = mins > 0 and ('%dm %06.3fs'):format(mins, secs) or ('%.3fs'):format(t)
     return measure and ('m%d  %s'):format(measure, ts) or ts
+end
+
+-- Returns true if project time t falls within tolerance of a 64th-note grid boundary.
+-- Coarser grids (32nd, 16th, 8th, quarter) are all subsets of 64th, so this covers them too.
+local function IsOnGrid(t)
+    local _, _, _, fullbeats, _ = r.TimeMap2_timeToBeats(0, t)
+    local frac64 = (fullbeats - math.floor(fullbeats)) * 16   -- position in 64th-note units (0-15.99...)
+    return math.abs(frac64 - math.floor(frac64 + 0.5)) < 0.05
 end
 
 local function GetTrackList()
@@ -2735,6 +2764,149 @@ local function ScanPitchSlidesAction()
     S.last_result = table.concat(lines, '\n')
 end
 
+local function ValidatePhrases()
+    local tracks = GetTrackList()
+    if #tracks == 0 or S.midi_idx >= #tracks then
+        S.status = 'Error'; S.last_result = 'Invalid MIDI destination track.'; return
+    end
+    local midi_track = r.GetTrack(0, tracks[S.midi_idx + 1].idx)
+    local _, midi_take = FindFirstMIDIItem(midi_track)
+    if not midi_take then
+        S.status = 'Error'
+        S.last_result = 'No MIDI item found on the destination track.'
+        return
+    end
+
+    -- Build PPQ -> lyric lookup from type-5 text events.
+    local lyric_at = {}
+    local _, _, _, n_text = r.MIDI_CountEvts(midi_take)
+    for i = 0, n_text - 1 do
+        local ok, _, _, ppq, typ, msg = r.MIDI_GetTextSysexEvt(midi_take, i)
+        if ok and typ == 5 then lyric_at[ppq] = msg end
+    end
+
+    -- Collect vocal notes (pitch 36-84) and phrase markers (pitch 105).
+    local vocal_notes    = {}
+    local phrase_markers = {}
+    local _, n_notes = r.MIDI_CountEvts(midi_take)
+    for i = 0, n_notes - 1 do
+        local ok, _, _, sppq, eppq, _, p = r.MIDI_GetNote(midi_take, i)
+        if ok then
+            local s_t = r.MIDI_GetProjTimeFromPPQPos(midi_take, sppq)
+            local e_t = r.MIDI_GetProjTimeFromPPQPos(midi_take, eppq)
+            if p >= RB3_MIN_PITCH and p <= RB3_MAX_PITCH then
+                vocal_notes[#vocal_notes + 1] = { s = s_t, e = e_t, lyric = lyric_at[sppq] }
+            elseif p == RB3_PHRASE_PITCH then
+                phrase_markers[#phrase_markers + 1] = { s = s_t, e = e_t }
+            end
+        end
+    end
+    table.sort(vocal_notes,    function(a, b) return a.s < b.s end)
+    table.sort(phrase_markers, function(a, b) return a.s < b.s end)
+
+    if #phrase_markers == 0 then
+        S.status = 'No phrase markers found.'
+        S.last_result = 'No phrase markers (pitch 105) found on the destination track — cannot validate.'
+        return
+    end
+
+    local lines     = {}
+    local bad_count = 0
+
+    for pm_i, pm in ipairs(phrase_markers) do
+        -- Compute 64th-note duration from adjacent beat times at the phrase start.
+        local _, _, _, fullbeats, _ = r.TimeMap2_timeToBeats(0, pm.s)
+        local beat_floor = math.floor(fullbeats)
+        local t_beat0    = r.TimeMap2_beatsToTime(0, beat_floor)
+        local t_beat1    = r.TimeMap2_beatsToTime(0, beat_floor + 1)
+        local dur_64th   = (t_beat1 - t_beat0) / 16
+
+        -- Vocal notes whose start falls within [pm.s, pm.e).
+        local notes_in = {}
+        for _, n in ipairs(vocal_notes) do
+            if n.s >= pm.s - 0.001 and n.s < pm.e - 0.001 then
+                notes_in[#notes_in + 1] = n
+            end
+        end
+
+        local viol = {}
+
+        -- Check 1: first vocal note has a capitalized lyric.
+        if notes_in[1] then
+            local lyric = notes_in[1].lyric
+            if lyric and lyric ~= '' then
+                local first = lyric:sub(1, 1)
+                if first ~= first:upper() then
+                    viol[#viol + 1] = ('Lyric not capitalized: "%s"'):format(lyric)
+                end
+            end
+        end
+
+        -- Check 2 & 3: phrase marker start and end on 64th-note grid.
+        if not IsOnGrid(pm.s) then viol[#viol + 1] = 'Start not on grid' end
+        if not IsOnGrid(pm.e) then viol[#viol + 1] = 'End not on grid'   end
+
+        -- Check 4: gap to next phrase >= 4 x 64th note.
+        if pm_i < #phrase_markers then
+            local gap_s   = phrase_markers[pm_i + 1].s - pm.e
+            local min_gap = 4 * dur_64th
+            if gap_s < min_gap - 0.001 then
+                viol[#viol + 1] = ('Too close to next phrase: %dms (need >= %dms / 4x64th)')
+                    :format(math.floor(gap_s * 1000 + 0.5), math.floor(min_gap * 1000 + 0.5))
+            end
+        end
+
+        -- Check 5: first note starts at least 2 x 64th notes after phrase start.
+        if notes_in[1] then
+            local lead     = notes_in[1].s - pm.s
+            local min_lead = 2 * dur_64th
+            if lead < min_lead - 0.001 then
+                viol[#viol + 1] = ('First note too close to phrase start: %dms (need >= %dms / 2x64th)')
+                    :format(math.floor(lead * 1000 + 0.5), math.floor(min_lead * 1000 + 0.5))
+            end
+        end
+
+        -- Check 6: last note ends at least 1 x 64th note before phrase end.
+        local last_note = notes_in[#notes_in]
+        if last_note then
+            local tail     = pm.e - last_note.e
+            local min_tail = dur_64th
+            if tail < min_tail - 0.001 then
+                viol[#viol + 1] = ('Last note too close to phrase end: %dms (need >= %dms / 1x64th)')
+                    :format(math.floor(tail * 1000 + 0.5), math.floor(min_tail * 1000 + 0.5))
+            end
+        end
+
+        if #viol > 0 then
+            bad_count = bad_count + 1
+            lines[#lines + 1] = ''
+            lines[#lines + 1] = FormatTime(pm.s)
+            for _, v in ipairs(viol) do
+                lines[#lines + 1] = '  - ' .. v
+            end
+        end
+    end
+
+    local n = #phrase_markers
+    local summary
+    if bad_count == 0 then
+        summary = ('Validated %d phrase%s — all OK.'):format(n, n == 1 and '' or 's')
+    else
+        summary = ('Validated %d phrase%s — %d with violations.'):format(
+            n, n == 1 and '' or 's', bad_count)
+        local ok_count = n - bad_count
+        if ok_count > 0 then
+            lines[#lines + 1] = ''
+            lines[#lines + 1] = ('All other %d phrase%s OK.'):format(
+                ok_count, ok_count == 1 and '' or 's')
+        end
+    end
+    table.insert(lines, 1, summary)
+
+    S.status      = summary
+    S.last_result = table.concat(lines, '\n')
+end
+
 local function ClearLyricsAction()
     local tracks = GetTrackList()
     if #tracks == 0 or S.midi_idx >= #tracks then
@@ -3293,6 +3465,21 @@ local function Loop()
                     ScanPitchSlidesAction()
                 end
                 Tooltip(TIPS.scan_slides)
+                r.ImGui_EndTabItem(ctx)
+            end
+
+            ------------------------------------------------------------
+            -- Tab: Validation
+            ------------------------------------------------------------
+            if r.ImGui_BeginTabItem(ctx, 'Validation') then
+                r.ImGui_Spacing(ctx)
+                r.ImGui_Text(ctx, 'Phrase validation')
+                r.ImGui_Spacing(ctx)
+                local bw_vp = r.ImGui_CalcTextSize(ctx, 'Validate phrases') + _bp
+                if r.ImGui_Button(ctx, 'Validate phrases', bw_vp, 24) then
+                    ValidatePhrases()
+                end
+                Tooltip(TIPS.validate_phrases)
                 r.ImGui_EndTabItem(ctx)
             end
 
